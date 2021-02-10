@@ -1,2 +1,4 @@
 tokens.json
 **/.DS_Store
+discord.log
+__pycache__/
