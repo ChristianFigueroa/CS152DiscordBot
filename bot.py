@@ -79,6 +79,10 @@ class ModBot(discord.Client, ReactionDelegator):
         author_id = message.author.id
         responses = []
 
+        # If the previous report was already completed, remove it from our map
+        if author_id in self.reports and self.reports[author_id].report_complete():
+            self.reports.pop(author_id)
+
         # Check if the user does not already have a report associated with them
         if author_id not in self.reports:
             # Handle a help message
@@ -96,7 +100,7 @@ class ModBot(discord.Client, ReactionDelegator):
                 return
 
             # Start a new Report
-            self.reports[author_id] = Report(self)
+            self.reports[author_id] = Report(self, message.author)
 
 
         # Let the report class handle this message; forward all the messages it returns to us
@@ -114,10 +118,6 @@ class ModBot(discord.Client, ReactionDelegator):
                 lastMessage = await message.channel.send(embed=response)
             else:
                 lastMessage = await message.channel.send(content=response)
-
-        # If the report is complete or cancelled, remove it from our map
-        if self.reports[author_id].report_complete():
-            self.reports.pop(author_id)
 
     async def handle_channel_message(self, message):
         # Only handle messages sent in the "group-#" channel

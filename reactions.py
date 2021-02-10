@@ -20,12 +20,9 @@ class Reaction():
 		toggle_handler = [] if toggle_handler is None else [toggle_handler] if callable(toggle_handler) else toggle_handler
 
 		try:
-			iter(click_handler)
-			iter(unclick_handler)
-			iter(toggle_handler)
-			self.click_handlers = click_handler
-			self.unclick_handlers = unclick_handler
-			self.toggle_handlers = toggle_handler 
+			self.click_handlers = tuple(iter(click_handler))
+			self.unclick_handlers = tuple(iter(unclick_handler))
+			self.toggle_handlers = tuple(iter(toggle_handler))
 		except:
 			raise TypeError("handlers must be a callable or list of callables")
 
