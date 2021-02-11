@@ -28,7 +28,6 @@ class State(Enum):
     CSAM_ENTRY            = auto()
     ADDITIONAL_COMMENT    = auto()
     FINALIZE_REPORT       = auto()
-    EDIT_REPORT           = auto()
     REPORT_COMPLETE       = auto()
 
 class AbuseType(Enum):
@@ -93,12 +92,17 @@ class Report:
 
     async def report_start(self, message, simulated=False):
         self.state = State.AWAITING_MESSAGE_LINK
-        return """
-            Thank you for starting the reporting process.
-            You can say `help` or `?` at any step for more information.
-            Please copy paste the link to the message you want to report.
-            You can obtain this link by right-clicking the message and clicking `Copy Message Link`.
-        """
+        return (
+            """
+                Thank you for starting the reporting process.
+                You can say `help` or `?` at any step for more information.
+                Say `cancel` or `quit` at any time to cancel your report.
+            """,
+            """
+                Please copy and paste the link to the message you want to report.
+                You can obtain this link by right-clicking the message and clicking `Copy Message Link`.
+            """
+        )
 
 
     @makeHelpMsg("""
@@ -588,11 +592,7 @@ class Report:
             )
 
 
-    async def edit_report(self, message, simulated=False):
-        pass
-
-
-    # Returns whether the Report has been completed (or cancelled).
+    # Returns whether the Report has been completed (or canceled).
     def report_complete(self):
         return self.state == State.REPORT_COMPLETE
 

@@ -32,7 +32,7 @@ def makeHelpMsg(*msgs):
         return innerwrapper
     return wrapper
 
-# Compiles the report's metadata into one single Embed.
+# Compiles the report's data into one single Embed.
 def reportPreview(report):
     embed = discord.Embed(
         color=discord.Color.blurple()

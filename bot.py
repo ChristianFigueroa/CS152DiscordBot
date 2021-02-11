@@ -10,6 +10,7 @@ import asyncio
 from textwrap import dedent
 from report import Report
 from reactions import Reaction, ReactionDelegator
+from helpers import YES_KEYWORDS, NO_KEYWORDS
 
 # Set up logging to the console
 logger = logging.getLogger('discord')
@@ -37,6 +38,7 @@ class ModBot(discord.Client, ReactionDelegator):
         self.group_num = None   
         self.mod_channels = {} # Map from guild to the mod channel id for that guild
         self.reports = {} # Map from user IDs to the state of their report
+        self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
         self.perspective_key = key
 
     async def on_ready(self):
@@ -78,6 +80,15 @@ class ModBot(discord.Client, ReactionDelegator):
 
         author_id = message.author.id
         responses = []
+
+        if self.reviewing_messages.get(author_id, False):
+            if message.content.lower() in YES_KEYWORDS:
+                await self.allow_user_message(**self.reviewing_messages[author_id])
+            elif message.content.lower() in NO_KEYWORDS:
+                await self.reject_user_message(**self.reviewing_messages[author_id])
+            else:
+                await message.channel.send(content="I didn't understand that. Reply with either `yes` or `no`.")
+            return
 
         # If the previous report was already completed, remove it from our map
         if author_id in self.reports and self.reports[author_id].report_complete():
@@ -121,8 +132,32 @@ class ModBot(discord.Client, ReactionDelegator):
 
     async def handle_channel_message(self, message):
         # Only handle messages sent in the "group-#" channel
-        if not message.channel.name == f'group-{self.group_num}':
-            return 
+        if message.channel.name != f'group-{self.group_num}':
+           return
+
+        scores = self.eval_text(message)
+
+        # await (message.author.dm_channel or await message.author.create_dm()).send(content="```" + json.dumps(scores, indent=2) + "```")
+
+        if scores["SPAM"] > 0.8:
+            return await self.confirm_user_message(message, explicit=False, reason="spam")
+
+        if scores["THREAT"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason="inciting violence")
+        elif scores["THREAT"] > 0.75:
+            return await self.confirm_user_message(message, explicit=False, reason="inciting violence")
+
+        if scores["IDENTITY_ATTACK"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason="hateful")
+        elif scores["IDENTITY_ATTACK"] > 0.75:
+            return await self.confirm_user_message(message, explicit=False, reason="hateful")
+
+        if scores["SEVERE_TOXICITY"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason="toxic")
+        elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
+            return await self.confirm_user_message(message, explicit=False, reason="toxic")
+
+        return
         
         # Forward the message to the mod channel
         mod_channel = self.mod_channels[message.guild.id]
@@ -143,11 +178,11 @@ class ModBot(discord.Client, ReactionDelegator):
             'languages': ['en'],
             'requestedAttributes': {
                 'SEVERE_TOXICITY': {},
-                'PROFANITY': {},
                 'IDENTITY_ATTACK': {},
+                'INSULT': {},
                 'THREAT': {},
                 'TOXICITY': {},
-                'FLIRTATION': {}
+                'SPAM': {}
             },
             'doNotStore': True
         }
@@ -159,10 +194,71 @@ class ModBot(discord.Client, ReactionDelegator):
             scores[attr] = response_dict["attributeScores"][attr]["summaryScore"]["value"]
 
         return scores
-    
-    def code_format(self, text):
-        return "```" + text + "```"
-            
-        
+
+
+    async def confirm_user_message(self, message, explicit=False, reason=None):
+        try:
+            await message.delete()
+        except:
+            pass
+
+        confirmUserMessageSession = {
+            "message": message,
+            "explicit": explicit,
+            "reason": reason
+        }
+        self.reviewing_messages[message.author.id] = confirmUserMessageSession
+
+        dmChannel = message.author.dm_channel or await message.author.create_dm()
+        msgEmbed = discord.Embed(
+            color=discord.Color.greyple(),
+            description=message.content
+        )
+        msgEmbed.set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+
+        await dmChannel.send(content=f"Your message was flagged{' as ' + reason if reason else ''} and removed:", embed=msgEmbed)
+        lastMsg = await dmChannel.send(content="Are you sure you want to send this message?" + (" It will be hidden from most users unless they decide to interact with the message." if explicit else ""))
+
+        # Add a Yes Reaction
+        await Reaction(
+            "✅",
+            click_handler=lambda self, reaction, user: \
+                self.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
+                asyncio.create_task(self.allow_user_message(**self.reviewing_messages[user.id]))
+        ).registerMessage(lastMsg)
+
+        # Add a No Reaction
+        await Reaction(
+            "🚫",
+            click_handler=lambda self, reaction, user: \
+                self.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
+                asyncio.create_task(self.reject_user_message(**self.reviewing_messages[user.id])) 
+        ).registerMessage(lastMsg)
+
+    async def allow_user_message(self, message, explicit=False, reason=None):
+        # Get the original message channel
+        origChannel = message.channel
+        # An "explicit" message is show in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
+        if explicit:
+            # Send a message to show who this mesage is from
+            await origChannel.send(content=f"The following message may contain inappropriate content.\n*{message.author.mention} says:*")
+            # Even though this works for plain, regular messages, it's pretty easy to get around this on Discord
+            # Surrounding anything in code blocks for example overrides spoilers
+            await origChannel.send(content="||" + message.content + "||")
+        else:
+            # Send a message to show who this mesage is from
+            await origChannel.send(content=f"*{message.author.mention} says:*")
+            # Show a non-explicit message as-is
+            await origChannel.send(content=message.content)
+
+        await (message.author.dm_channel or await message.author.create_dm()).send(content="Your original message has been re-sent. Thank you for taking the time to reconsider your message.")
+
+        self.reviewing_messages[message.author.id] = False
+
+    async def reject_user_message(self, message, explicit=False, reason=None):
+        await (message.author.dm_channel or await message.author.create_dm()).send(content="Thank you for taking the time to reconsider your message.")
+        self.reviewing_messages[message.author.id] = False
+
+
 client = ModBot(perspective_key)
 client.run(discord_token)
