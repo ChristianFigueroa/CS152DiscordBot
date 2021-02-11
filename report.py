@@ -2,8 +2,11 @@ from enum import Enum, auto
 import discord
 import re
 import asyncio
-from textwrap import dedent as _dedent
+import time
 from reactions import Reaction
+from collections import OrderedDict
+from difflib import SequenceMatcher
+from helpers import *
 
 # The different states the Report can be in.
 # Each State's name identifies the method that gets called when a message comes in.
@@ -15,59 +18,45 @@ class State(Enum):
     SPAM_ENTRY            = auto()
     HATEFUL_ENTRY         = auto()
     SEXUAL_ENTRY          = auto()
-    HARRASS_ENTRY         = auto()
-    HARRASS_ADD_COMMENT   = auto()
+    HARASS_ENTRY          = auto()
+    HARASS_ADD_COMMENT    = auto()
     BULLYING_ENTRY        = auto()
+    BULLYING_ADD_USER     = auto()
+    BULLYING_ADD_COMMENT  = auto()
     HARMFUL_ENTRY         = auto()
     VIOLENCE_ENTRY        = auto()
     CSAM_ENTRY            = auto()
-    REPORT_COMPLETE       = auto()
+    ADDITIONAL_COMMENT    = auto()
     FINALIZE_REPORT       = auto()
     EDIT_REPORT           = auto()
+    REPORT_COMPLETE       = auto()
 
 class AbuseType(Enum):
     SPAM      = "Misinformation or Spam"
     HATEFUL   = "Hateful Content"
     SEXUAL    = "Sexual Content"
-    HARRASS   = "Harrassment"
-    BULLLYING = "Bullying"
-    HARMFUL   = "Hamrful/Dangerous Content"
+    HARASS    = "Harassment"
+    BULLYING = "Bullying"
+    HARMFUL   = "Harmful/Dangerous Content"
     VIOLENCE  = "Promoting Violence or Terrorism"
     CSAM      = "Child Abuse"
 
-
-# Used to generate help messages for each State
-# Use as a decorator: @makeHelpMsg("Some help message here!") [rest of function after it]
-def makeHelpMsg(*msgs):
-    if len(msgs) == 1 and not isinstance(msgs[0], str):
-        try:
-            msgs = tuple(iter(msgs[0]))
-        except:
-            pass
-    def wrapper(func):
-        async def innerwrapper(self, message, *args, **kwargs):
-            print(message, msgs)
-            return msgs if message.lower() in Report.HELP_KEYWORDS else await func(self, message, *args, **kwargs)
-        return innerwrapper
-    return wrapper
-
-def dedent(obj):
-    return _dedent(obj) if isinstance(obj, str) else obj
-
-emergencyWarning = discord.Embed(title="In an emergency, call 911.", description="We will review your report as soon as we can, but calling 911 or other local authorities is the fastest and most effective way to handle emergencies.", color=discord.Color.red())
+emergencyWarning = discord.Embed(
+    title="Call 911 in an emergency.",
+    description="We will review your report as soon as we can, but calling 911 or other local authorities is the fastest and most effective way to handle emergencies.",
+    color=discord.Color.red()
+)
 
 
 class Report:
-    START_KEYWORDS = ("report")
-    CANCEL_KEYWORDS = ("cancel", "quit", "exit")
-    HELP_KEYWORDS = ("help", "?")
+    START_KEYWORDS = START_KEYWORDS
+    CANCEL_KEYWORDS = CANCEL_KEYWORDS
+    HELP_KEYWORDS = HELP_KEYWORDS
 
     def __init__(self, client, author=None):
         self.state = State.REPORT_START
         self.client = client
-        self.message = None
-        self.abuse_type = None
-        self.personally_involved = None
+        self.report_fields = OrderedDict.fromkeys(("Abuse Type", "Message"))
         self.author = author
     
     async def handle_message(self, message, *args, simulated=False, **kwargs):
@@ -156,7 +145,7 @@ class Report:
             """
 
         # We found the message
-        self.message = message
+        self.report_fields["Message"] = message
         self.state = State.AWAITING_ABUSE_TYPE
         return (
             "I found this message:",
@@ -167,24 +156,17 @@ class Report:
             ),
             """
                 Please tell us what you think is inappropriate about this message:
-                  1. Misinformation or Spam
-                  2. Hateful Content
-                  3. Sexual Content
-                  4. Harrassment
-                  5. Bullying
-                  6. Harmful/Dangerous Content
-                  7. Promoting Violence or Terrorism
-                  8. Child Abuse
+                 1. Misinformation or Spam
+                 2. Hateful Content
+                 3. Sexual Content
+                 4. Harassment
+                 5. Bullying
+                 6. Harmful/Dangerous Content
+                 7. Promoting Violence or Terrorism
+                 8. Child Abuse
                 You can enter a keyword to choose one, or select a button below.
             """,
-            Reaction("1️⃣", click_handler=self.simulateReply("1")),
-            Reaction("2️⃣", click_handler=self.simulateReply("2")),
-            Reaction("3️⃣", click_handler=self.simulateReply("3")),
-            Reaction("4️⃣", click_handler=self.simulateReply("4")),
-            Reaction("5️⃣", click_handler=self.simulateReply("5")),
-            Reaction("6️⃣", click_handler=self.simulateReply("6")),
-            Reaction("7️⃣", click_handler=self.simulateReply("7")),
-            Reaction("8️⃣", click_handler=self.simulateReply("8"))
+            *reactNumerical(self, 8)
         )
 
 
@@ -205,7 +187,7 @@ class Report:
                     If you have any comments you want to add to your report, enter them now.
                     Otherwise, you can push the checkmark below, or say `done`.
                 """,
-                Reaction("✅", click_handler=self.simulateReply("done"))
+                *reactDone(self)
             )
         elif message == "2" or any(keyword in ("hateful", "hate", "hatred", "racism", "racist", "sexist", "sexism") for keyword in keywords):
             self.state = State.HATEFUL_ENTRY
@@ -220,7 +202,7 @@ class Report:
                     If you have any comments you want to add to your report, enter them now.
                     Otherwise, you can push the checkmark below, or say `done`.
                 """,
-                Reaction("✅", click_handler=self.simulateReply("done"))
+                *reactDone(self)
             )
         elif message == "3" or any(keyword in ("sexual", "sex", "nude", "nudity", "naked") for keyword in keywords):
             self.state = State.SEXUAL_ENTRY
@@ -235,19 +217,18 @@ class Report:
                     If you have any comments you want to add to your report, enter them now.
                     Otherwise, you can push the checkmark below, or say `done`.
                 """,
-                Reaction("✅", click_handler=self.simulateReply("done"))
+                *reactDone(self)
             )
-        elif message == "4" or any(keyword in ("harrassment", "harrass", "harrassing") for keyword in keywords):
-            self.state = State.HARRASS_ENTRY
+        elif message == "4" or any(keyword in ("harassment", "harass", "harassing") for keyword in keywords):
+            self.state = State.HARASS_ENTRY
             return (
                 """
-                    You selected: __4. Harrassment__
+                    You selected: __4. Harassment__
                 """,
                 """
                     Does the content target you specifically?
                 """,
-                Reaction("✅", click_handler=self.simulateReply("yes")),
-                Reaction("🚫", click_handler=self.simulateReply("no"))
+                *reactYesNo(self)
             )
         elif message == "5" or any(keyword in ("bullying", "bully", "bullies", "cyberbullying", "cyberbully", "cyberbullies") for keyword in keywords):
             self.state = State.BULLYING_ENTRY
@@ -255,31 +236,47 @@ class Report:
                 """
                     You selected: __5. Bullying__
                 """,
-                emergencyWarning
+                emergencyWarning,
+                """
+                    Are you specifically the target of this bullying?
+                """,
+                *reactYesNo(self)
             )
-        elif message == "5" or any(keyword in ("harmful", "dangerous", "harm", "danger", "self-harm") for keyword in keywords):
+        elif message == "6" or any(keyword in ("harmful", "dangerous", "harm", "danger", "self-harm") for keyword in keywords):
             self.state = State.HARMFUL_ENTRY
             return (
                 """
                     You selected: __6. Harmful/Dangerous Content__
                 """,
-                emergencyWarning
+                emergencyWarning,
+                """
+                    Does the content contain any self-harm or suicide that requires immediate action?
+                """,
+                *reactYesNo(self)
             )
-        elif message == "6" or any(keyword in ("violence", "violent", "terrorism", "terror", "terrorist", "promote", "incite") for keyword in keywords):
+        elif message == "7" or any(keyword in ("violence", "violent", "terrorism", "terror", "terrorist", "promote", "incite", "inciting", "incites") for keyword in keywords):
             self.state = State.VIOLENCE_ENTRY
             return (
                 """
                     You selected: __7. Promoting Violence or Terrorism__
                 """,
-                emergencyWarning
+                emergencyWarning,
+                """
+                    Does the content contain any events that are currently happening and require immediate action?
+                """,
+                *reactYesNo(self)
             )
-        elif message == "7" or any(keyword in ("child", "children", "kid", "kids", "minor", "minors", "abuse", "csam") for keyword in keywords):
+        elif message == "8" or any(keyword in ("child", "children", "kid", "kids", "minor", "minors", "abuse", "csam") for keyword in keywords):
             self.state = State.CSAM_ENTRY
             return (
                 """
                     You selected: __8. Child Abuse__
                 """,
-                emergencyWarning
+                emergencyWarning,
+                """
+                    Does the content contain any events that are currently happening and require immediate action?
+                """,
+                *reactYesNo(self)
             )
 
 
@@ -292,139 +289,302 @@ class Report:
         Enter additional comments to submit alongside your report, or type `done` to skip this step.
     """)
     async def spam_entry(self, message, simulated=False):
-        self.abuse_type = AbuseType.SPAM
-        self.report_comment = None if message.lower() == "done" else message
-
-        self.state = State.FINALIZE_REPORT
-        return (
-            """
-                This is what your report looks like so far:
-            """,
-            self.previewReport(),
-            """
-                Are you ready to send it?
-            """,
-            Reaction("✅", click_handler=self.simulateReply("yes")),
-            Reaction("🚫", click_handler=self.simulateReply("no"))
-        )
+        self.report_fields["Abuse Type"] = AbuseType.SPAM
+        return await self.additional_comment(message, simulated=simulated)
 
 
     @makeHelpMsg("""
         Enter additional comments to submit alongside your report, or type `done` to skip this step.
     """)
     async def hateful_entry(self, message, simulated=False):
-        self.abuse_type = AbuseType.SEXUAL
-        self.report_comment = None if message.lower() == "done" else message
-
-        self.state = State.FINALIZE_REPORT
-        return (
-            """
-                This is what your report looks like so far:
-            """,
-            self.previewReport(),
-            """
-                Are you ready to send it?
-            """,
-            Reaction("✅", click_handler=self.simulateReply("yes")),
-            Reaction("🚫", click_handler=self.simulateReply("no"))
-        )
+        self.report_fields["Abuse Type"] = AbuseType.HATEFUL
+        return await self.additional_comment(message, simulated=simulated)
 
 
     @makeHelpMsg("""
         Enter additional comments to submit alongside your report, or type `done` to skip this step.
     """)
     async def sexual_entry(self, message, simulated=False):
-        self.abuse_type = AbuseType.SEXUAL
-        self.report_comment = None if message.lower() == "done" else message
-
-        self.state = State.FINALIZE_REPORT
-        return (
-            """
-                This is what your report looks like so far:
-            """,
-            self.previewReport(),
-            """
-                Are you ready to send it?
-            """,
-            Reaction("✅", click_handler=self.simulateReply("yes")),
-            Reaction("🚫", click_handler=self.simulateReply("no"))
-        )
+        self.report_fields["Abuse Type"] = AbuseType.SEXUAL
+        return await self.additional_comment(message, simulated=simulated)
 
 
     @makeHelpMsg("""
-        Select whether the message you are reporting is harrassing you specifically.
+        Select whether the message you are reporting is harassing you specifically.
         If it is affecting someone else you know, select no.
         You can type `yes` or `no`, or select one of the buttons above.
     """)
-    async def harrass_entry(self, message, simulated=False):
-        self.abuse_type = AbuseType.HARRASS
-        if message.lower() in ("yes", "y", "yeah", "yup", "sure"):
-            self.personally_involved = True
-        elif message.lower() in ("no", "n", "nah", "naw", "nope"):
-            self.personally_involved = False
-        self.state = State.HARRASS_ADD_COMMENT
+    async def harass_entry(self, message, simulated=False):
+        self.report_fields["Abuse Type"] = AbuseType.HARASS
+        if message.lower() in YES_KEYWORDS:
+            self.report_fields["Personally Involved"] = True
+        elif message.lower() in NO_KEYWORDS:
+            self.report_fields["Personally Involved"] = False
+        else:
+            return """
+                Sorry, I didn't understand that, please say `yes` or `no`.
+            """
+
+        self.state = State.ADDITIONAL_COMMENT
         return (
             """
                 If you have any comments you want to add to your report, enter them now.
                 Otherwise, you can push the checkmark below, or say `done`.
             """,
-            Reaction("✅", click_handler=self.simulateReply("done"))
+            *reactDone(self)
         )
+
+
+    @makeHelpMsg("""
+        Select whether you are the victim of the bullying.
+        If you are submitting this report on someone else's behalf, select no (you'll have a chance to specify who).
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def bullying_entry(self, message, simulated=False):
+        self.report_fields["Abuse Type"] = AbuseType.BULLYING
+        if message.lower() in YES_KEYWORDS:
+            self.report_fields["Personally Involved"] = True
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                """
+                    If you have any comments you want to add to your report, enter them now.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        elif message.lower() in NO_KEYWORDS:
+            self.report_fields["Personally Involved"] = False
+            self.state = State.BULLYING_ADD_USER
+            return (
+                """
+                    If you want to specify the user being victimized, you can do so here. This will help us review your report faster.
+                    Otherwise, you can push the checkmark below, or say `done` to leave this empty.
+                """,
+                *reactDone(self)
+            )
+        else:
+            return """
+                Sorry, I didn't understand that, please say `yes` or `no`.
+            """
+
+
+    @makeHelpMsg("""
+        Type a username to search for them. The `@` at the beginning isn't necessary (since they won't appear in DMs).
+        You can also search by their nickname in a guild.
+    """)
+    async def bullying_add_user(self, message, simulated=False):
+        if message.lower() == "done":
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                """
+                    If you have any comments you want to add to your report, enter them now.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+
+        if message[0] == "@":
+            message = message[1:]
+
+        # Get a list of guilds that both the bot and the user are both in
+        commonGuilds = []
+        for guild in self.client.guilds:
+            if discord.utils.get(guild.members, id=self.author.id) is not None:
+                commonGuilds.append(guild)
+
+        # Search each common guild for a user with the specified user name or display name.
+        for guild in commonGuilds:
+            matches = findUsers(guild, message)
+
+            # Check if we only got one result
+            if len(matches) == 1:
+                member = matches[0]
+                if "Personally Involved" in self.report_fields:
+                    del self.report_fields["Personally Involved"]
+                self.report_fields["Victimized User"] = member
+
+                self.state = State.ADDITIONAL_COMMENT
+                return (
+                    f"""
+                        You selected {member.mention} – **{member.display_name}**#{member.discriminator}
+                    """,
+                    """
+                        If you have any comments you want to add to your report, enter them now.
+                        Otherwise, you can push the checkmark below, or say `done`.
+                    """,
+                    *reactDone(self)
+                )
+            # Show that there were multiple users (ask for username AND discriminator)
+            elif len(matches) >= 2:
+                matches = matches[:10]
+                return (
+                    oneComment(
+                        """
+                            There were multiple results for your search:
+                        """,
+                        *(f" {i+1}. {text}" for i, text in enumerate(map(lambda member: f"{member.mention} – **{member.display_name}**#{member.discriminator}", matches))),
+                        f"""
+                            Please search using both the **Username** *and* #Discriminator (e.g., `{self.author.name}#{self.author.discriminator}`).
+                        """
+                    ),
+                    *reactNumerical(self, (f"{member.name}#{member.discriminator}" for member in matches))
+                )
+            # Show that there were no results
+            else:
+                return f"""
+                    I couldn't find any users with the user name `{message}`. Only users in guilds we are both a part of are searchable.
+                    Please try again or say `done` to skip this step.
+                """
+
+
+    @makeHelpMsg("""
+        Please let us know whether this situation requires immediate action.
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def harmful_entry(self, message, simulated=False):
+        self.report_fields["Abuse Type"] = AbuseType.HARMFUL
+        if message.lower() in YES_KEYWORDS:
+            self.report_fields["Urgent Situation"] = True
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                discord.Embed(
+                    title="Call 911",
+                    description="""
+                        We will do what we can to reach out to this person on our end as soon as we can, but please take immediate action or let someone know who can. Time-sensitive emergencies can be best handled by local authorities.
+                    """,
+                    color=discord.Color.red()
+                ),
+                """
+                    If you have any additional info, please add it here, including any important details you think will help us solve this issue as fast as possible.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        elif message.lower() in NO_KEYWORDS:
+            self.report_fields["Urgent Situation"] = False
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                """
+                    If you have any comments you want to add to your report, enter them now.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        else:
+            return """
+                Sorry, I didn't understand that, please say `yes` or `no`.
+            """
+
+
+    @makeHelpMsg("""
+        Please let us know whether this situation requires immediate action.
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def violence_entry(self, message, simulated=False):
+        self.report_fields["Abuse Type"] = AbuseType.VIOLENCE
+        if message.lower() in YES_KEYWORDS:
+            self.report_fields["Urgent Situation"] = True
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                discord.Embed(
+                    title="Call 911",
+                    description="""
+                        We will do what we can to reach out to this person on our end as soon as we can, but please take immediate action or let someone know who can. Time-sensitive emergencies can be best handled by local authorities.
+                    """,
+                    color=discord.Color.red()
+                ),
+                """
+                    If you have any additional info, please add it here, including any important details you think will help us solve this issue as fast as possible.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        elif message.lower() in NO_KEYWORDS:
+            self.report_fields["Urgent Situation"] = False
+            self.state = State.ADDITIONAL_COMMENT
+            return ("""
+                    If you have any comments you want to add to your report, enter them now.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        else:
+            return """
+                Sorry, I didn't understand that, please say `yes` or `no`.
+            """
+
+
+    @makeHelpMsg("""
+        Please let us know whether this situation requires immediate action.
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def csam_entry(self, message, simulated=False):
+        self.report_fields["Abuse Type"] = AbuseType.CSAM
+        if message.lower() in YES_KEYWORDS:
+            self.report_fields["Urgent Situation"] = True
+            self.state = State.ADDITIONAL_COMMENT
+            return (
+                discord.Embed(
+                    title="Call 911",
+                    description="""
+                        We will do what we can to reach out to this person on our end as soon as we can, but please take immediate action or let someone know who can. Time-sensitive emergencies can be best handled by local authorities.
+                    """,
+                    color=discord.Color.red()
+                ),
+                """
+                    If you have any additional info, please add it here, including any important details you think will help us solve this issue as fast as possible.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        elif message.lower() in NO_KEYWORDS:
+            self.report_fields["Urgent Situation"] = False
+            self.state = State.ADDITIONAL_COMMENT
+            return ("""
+                    If you have any comments you want to add to your report, enter them now.
+                    Otherwise, you can push the checkmark below, or say `done`.
+                """,
+                *reactDone(self)
+            )
+        else:
+            return """
+                Sorry, I didn't understand that, please say `yes` or `no`.
+            """
 
 
     @makeHelpMsg("""
         Enter additional comments to submit alongside your report, or type `done` to skip this step.
     """)
-    async def harrass_add_comment(self, message, simulated=False):
-        self.report_comment = None if message.lower() == "done" else message
+    async def additional_comment(self, message, simulated=False):
+        self.report_fields["Additional Comments"] = None if message.lower() == "done" else message
 
         self.state = State.FINALIZE_REPORT
         return (
             """
                 This is what your report looks like so far:
             """,
-            self.previewReport(),
+            reportPreview(self),
             """
-                Are you ready to send it?
+                Press the checkmark below, or type `done` when you're ready to send it.
             """,
-            Reaction("✅", click_handler=self.simulateReply("yes")),
-            Reaction("🚫", click_handler=self.simulateReply("no"))
+            *reactDone(self)
         )
 
 
-    async def bullying_entry(self, message, simulated=False):
-        return "Not Implemented"
-
-
-    async def harmful_entry(self, message, simulated=False):
-        return "Not Implemented"
-
-
-    async def violence_entry(self, message, simulated=False):
-        return "Not Implemented"
-
-
-    async def csam_entry(self, message, simulated=False):
-        return "Not Implemented"
-
-
     @makeHelpMsg("""
-        Decide whether you're ready to send your report by replying with `yes` or `no`, or clicking one of the buttons above.
+        Review your report above and type `done` when you're ready to submit.
     """)
     async def finalize_report(self, message, simulated=False):
-        if message.lower() in ("yes", "y", "yeah", "yup", "sure"):
+        if message.lower() in ("done", "ready"):
+            self.state = State.REPORT_COMPLETE
             return self.sendReport()
-        elif message.lower() in ("no", "n", "nah", "naw", "nope"):
-            self.state = State.EDIT_REPORT
-
-            fields = ["Type", "Message"]
-            if self.abuse_type == AbuseType.HARRASS:
-                fields.append("Personally Involved")
-            fields.append("Additional Comments")
-            fields = "\n".join(f"  {i + 1}. {content}" for i, content in enumerate(fields))
-
+        else:
             return (
-                "What would you like to change?\n" + fields
+                """
+                    Sorry, I didn't understand that.
+                    Please say `done` when you're ready to send your report, or press the checkmark below.
+                """,
+                *reactDone(self)
             )
 
 
@@ -462,21 +622,41 @@ class Report:
                     lastMessage = await reaction.message.channel.send(content=response)
         return sendReply
 
-    # Compiles the report's metadata into one single Embed.
-    def previewReport(self):
-        embed = discord.Embed(
-            title=f"Report from {self.author.display_name}" if self.author else "Report",
-            color=discord.Color.blurple()
-        )
-        embed.add_field(name="Type", value=self.abuse_type.value, inline=False)
-        embed.add_field(name="Message", value=self.message.content, inline=False)
-        if self.personally_involved is not None:
-            embed.add_field(name="Personally Involved", value="Yes" if self.personally_involved else "No", inline=False)
-        embed.add_field(name="Additional Comments", value="*[No additional comments]*" if self.report_comment is None else self.report_comment, inline=False)
-        return embed
-
     def sendReport(self):
-        ###### TODO: Send report to mod channel
+        reportDict = reportPreview(self).to_dict()
+
+        abuseType = self.report_fields["Abuse Type"]
+
+        if abuseType == AbuseType.SPAM:
+            urgency = 0
+        elif abuseType == AbuseType.HATEFUL or abuseType == AbuseType.SEXUAL:
+            urgency = 1
+        elif abuseType == AbuseType.HARASS:
+            urgency = 3 if self.report_fields["Personally Involved"] else 2
+        elif abuseType == AbuseType.BULLYING:
+            urgency = 3
+        elif abuseType == AbuseType.VIOLENCE or abuseType == AbuseType.HARMFUL:
+            urgency = 4 if self.report_fields["Urgent Situation"] else 3
+        elif abuseType == AbuseType.CSAM:
+            urgency = 4
+
+        reportDict["color"] = (
+            discord.Color.dark_gray().value,
+            discord.Color.green().value,
+            discord.Color.gold().value,
+            discord.Color.orange().value,
+            discord.Color.red().value
+        )[urgency]
+
+        reportEmbed = discord.Embed.from_dict(reportDict)
+
+        reportEmbed.insert_field_at(0, name="Urgency", value=("Very Low", "Low", "Moderate", "High", "Very High")[urgency])
+        reportEmbed.set_author(name=f"{self.author.display_name} – User Report", icon_url=self.author.avatar_url)
+        reportEmbed.set_footer(text=f"This report was submitted on {time.strftime('%b %d, %Y at %I:%M %p %Z')}")
+
+        for channel in self.client.mod_channels.values():
+            asyncio.create_task(channel.send(embed=reportEmbed))
+
         return """
             Thank you for reporting! You will receive a message when someone on the moderation team has reviewed your report.
         """
