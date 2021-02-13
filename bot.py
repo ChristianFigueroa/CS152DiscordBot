@@ -8,9 +8,15 @@ import re
 import requests
 import asyncio
 from textwrap import dedent
-from report import Report
+from report import OpenUserReport, Report, AutomatedReport, AbuseType
 from reactions import Reaction, ReactionDelegator
 from helpers import YES_KEYWORDS, NO_KEYWORDS
+
+
+# Controls whether messages in DMs with the bot should also be monitored
+# This is option only applies when a user is not sending a report
+FILTER_DMS = False
+
 
 # Set up logging to the console
 logger = logging.getLogger('discord')
@@ -37,9 +43,11 @@ class ModBot(discord.Client, ReactionDelegator):
         super().__init__(command_prefix='.', intents=intents)
         self.group_num = None   
         self.mod_channels = {} # Map from guild to the mod channel id for that guild
-        self.reports = {} # Map from user IDs to the state of their report
+        self.user_reports = {} # Map from user IDs to the state of their report
         self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
         self.perspective_key = key
+        self.pending_reports = {} # Map from user IDs to a report they are reviewing
+
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is in these guilds:')
@@ -81,6 +89,7 @@ class ModBot(discord.Client, ReactionDelegator):
         author_id = message.author.id
         responses = []
 
+        # Check if the user is currently reviewing one of their own messages
         if self.reviewing_messages.get(author_id, False):
             if message.content.lower() in YES_KEYWORDS:
                 await self.allow_user_message(**self.reviewing_messages[author_id])
@@ -90,33 +99,40 @@ class ModBot(discord.Client, ReactionDelegator):
                 await message.channel.send(content="I didn't understand that. Reply with either `yes` or `no`.")
             return
 
+        # Check if the user is a moderator currently reviewing a report
+        if self.pending_reports.get(author_id, False):
+            return await self.pending_reports[author_id].forward_message(message)
+
         # If the previous report was already completed, remove it from our map
-        if author_id in self.reports and self.reports[author_id].report_complete():
-            self.reports.pop(author_id)
+        if author_id in self.user_reports and self.user_reports[author_id].report_complete():
+            self.user_reports.pop(author_id)
 
         # Check if the user does not already have a report associated with them
-        if author_id not in self.reports:
+        if author_id not in self.user_reports:
             # Handle a help message
-            if content.lower() in Report.HELP_KEYWORDS:
+            if content.lower() in OpenUserReport.HELP_KEYWORDS:
                 await message.channel.send(dedent("""
                     Use the `report` command to begin the reporting process.
                 """))
                 return
 
             # Tell the user how to start a new report
-            if content.lower() not in Report.START_KEYWORDS:
+            if content.lower() not in OpenUserReport.START_KEYWORDS:
                 await message.channel.send(dedent("""
                     You do not have a report open; use the `report` command to begin the reporting process, or `help` for more help.
                 """))
+                # Filter this message if FILTER_DMS is on
+                if FILTER_DMS:
+                    await self.handle_channel_message(message)
                 return
 
-            # Start a new Report
-            self.reports[author_id] = Report(self, message.author)
+            # Start a new OpenUserReport
+            self.user_reports[author_id] = OpenUserReport(self, message.author)
 
 
         # Let the report class handle this message; forward all the messages it returns to us
         try:
-            responses = await self.reports[author_id].handle_message(message)
+            responses = await self.user_reports[author_id].handle_message(message)
         except Exception as e:
             await message.channel.send("Uh oh! There was a problem in the code! Check the console for more information.")
             raise e
@@ -130,9 +146,10 @@ class ModBot(discord.Client, ReactionDelegator):
             else:
                 lastMessage = await message.channel.send(content=response)
 
+
     async def handle_channel_message(self, message):
-        # Only handle messages sent in the "group-#" channel
-        if message.channel.name != f'group-{self.group_num}':
+        # Only handle messages sent in the "group-#" channel or DMs
+        if not (FILTER_DMS and isinstance(message.channel, discord.DMChannel)) and message.channel.name != f'group-{self.group_num}':
            return
 
         scores = self.eval_text(message)
@@ -140,31 +157,23 @@ class ModBot(discord.Client, ReactionDelegator):
         # await (message.author.dm_channel or await message.author.create_dm()).send(content="```" + json.dumps(scores, indent=2) + "```")
 
         if scores["SPAM"] > 0.8:
-            return await self.confirm_user_message(message, explicit=False, reason="spam")
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
 
         if scores["THREAT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason="inciting violence")
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE)
         elif scores["THREAT"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason="inciting violence")
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE)
 
         if scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason="hateful")
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL)
         elif scores["IDENTITY_ATTACK"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason="hateful")
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL)
 
         if scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason="toxic")
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
         elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=False, reason="toxic")
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS)
 
-        return
-        
-        # Forward the message to the mod channel
-        mod_channel = self.mod_channels[message.guild.id]
-        await mod_channel.send(f'Forwarded message:\n{message.author.name}: "{message.content}"')
-
-        scores = self.eval_text(message)
-        await mod_channel.send(self.code_format(json.dumps(scores, indent=2)))
 
     def eval_text(self, message):
         '''
@@ -197,6 +206,11 @@ class ModBot(discord.Client, ReactionDelegator):
 
 
     async def confirm_user_message(self, message, explicit=False, reason=None):
+        # DMs a user asking if they are sure they want to send a message
+        # explicit indicates whether the message should be hidden if they do decide to send it
+        # reason is the reason for flagging the initial message (should be an AbuseType)
+
+        # message.delete() fails in DMs
         try:
             await message.delete()
         except:
@@ -209,6 +223,7 @@ class ModBot(discord.Client, ReactionDelegator):
         }
         self.reviewing_messages[message.author.id] = confirmUserMessageSession
 
+        # Build an Embed to show them their initial message
         dmChannel = message.author.dm_channel or await message.author.create_dm()
         msgEmbed = discord.Embed(
             color=discord.Color.greyple(),
@@ -216,48 +231,127 @@ class ModBot(discord.Client, ReactionDelegator):
         )
         msgEmbed.set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
 
-        await dmChannel.send(content=f"Your message was flagged{' as ' + reason if reason else ''} and removed:", embed=msgEmbed)
+        if reason:
+            textReason = {
+                AbuseType.SPAM: " as spam",
+                AbuseType.VIOLENCE: " for inciting violence",
+                AbuseType.HATEFUL: " as hateful",
+                AbuseType.HARASS: " as toxic",
+            }[reason]
+        else:
+            textReason = ""
+
+        # Show the user their initial message
+        await dmChannel.send(content=f"Your message was flagged{textReason} and removed:", embed=msgEmbed)
+        # Ask if they really want to send it
+        # If it's marked as explicit, show that their message will be hidden behind a || spoiler ||
         lastMsg = await dmChannel.send(content="Are you sure you want to send this message?" + (" It will be hidden from most users unless they decide to interact with the message." if explicit else ""))
 
-        # Add a Yes Reaction
+        # Add a Yes Reaction to choose to continue sending the message
+        # Saying the word `yes` does the same thing
         await Reaction(
             "✅",
-            click_handler=lambda self, reaction, user: \
-                self.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
-                asyncio.create_task(self.allow_user_message(**self.reviewing_messages[user.id]))
+            click_handler=lambda self, client, reaction, user: \
+                client.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
+                asyncio.create_task(client.allow_user_message(**client.reviewing_messages[user.id]))
         ).registerMessage(lastMsg)
 
-        # Add a No Reaction
+        # Add a No Reaction to prevent sending the message
+        # Saying the word `no` does the same thing
         await Reaction(
             "🚫",
-            click_handler=lambda self, reaction, user: \
-                self.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
-                asyncio.create_task(self.reject_user_message(**self.reviewing_messages[user.id])) 
+            click_handler=lambda self, client, reaction, user: \
+                client.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
+                asyncio.create_task(client.reject_user_message(**client.reviewing_messages[user.id])) 
         ).registerMessage(lastMsg)
 
     async def allow_user_message(self, message, explicit=False, reason=None):
+        # This is run when a user decides to send a message that the bot flagged.
+
         # Get the original message channel
         origChannel = message.channel
+
+        sentMsg = None
+        prefixMsg = None
+
         # An "explicit" message is show in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
         if explicit:
-            # Send a message to show who this mesage is from
-            await origChannel.send(content=f"The following message may contain inappropriate content.\n*{message.author.mention} says:*")
-            # Even though this works for plain, regular messages, it's pretty easy to get around this on Discord
-            # Surrounding anything in code blocks for example overrides spoilers
-            await origChannel.send(content="||" + message.content + "||")
+            content = message.content
+            # This alters the message slightly to disallow clever mardown formatting from getting through the spoiler
+            # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
+            reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
+            while reMatch:
+                code = reMatch.group(1).split("\n")
+                longestLine = max(map(lambda line: len(line), code))
+                code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
+                content = content[:reMatch.start()] + code + content[reMatch.end():]
+                reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
+
+            # Now, any "||" in code blocks are converted to a look-alike (by inserting a zero-width space in between them)
+            # This is to prevent them from being recognized as closing spoiler elements
+            # Outside of code blocks, we can just escape the double bars with a "\|" but code blocks will show the literal "\"
+            reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
+            while reMatch:
+                content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
+
+            # Remove any remaining spoiler tags in the comment by escaping each "|"
+            content = content.replace("||", "\\|\\|")
+
+            # Send a message to show who this message is from
+            prefixMsg = await origChannel.send(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{message.author.mention} says:*")
+            
+            # Send the hidden message
+            sentMsg = await origChannel.send(content="||" + content + "||")
         else:
-            # Send a message to show who this mesage is from
-            await origChannel.send(content=f"*{message.author.mention} says:*")
+            # Send a message to show who this message is from
+            prefixMsg = await origChannel.send(content=f"*{message.author.mention} says:*")
             # Show a non-explicit message as-is
-            await origChannel.send(content=message.content)
+            sentMsg = await origChannel.send(content=message.content)
 
-        await (message.author.dm_channel or await message.author.create_dm()).send(content="Your original message has been re-sent. Thank you for taking the time to reconsider your message.")
-
+        # Show the user that their message was sent
+        await (message.author.dm_channel or await message.author.create_dm()).send(
+            content="Your original message has been re-sent. You can jump to it by clicking below. Thank you for taking the time to reconsider your message:",
+            embed=discord.Embed(description=f"[Go to your message]({sentMsg.jump_url})", color=discord.Color.blue())
+        )
         self.reviewing_messages[message.author.id] = False
+
+        if reason:
+            urgency = {
+                AbuseType.SPAM: 0,
+                AbuseType.VIOLENCE: 2,
+                AbuseType.HATEFUL: 1,
+                AbuseType.HARASS: 1
+            }[reason]
+        else:
+            urgency = 0
+
+        report = AutomatedReport(
+            client=self,
+            urgency=urgency,
+            abuse_type=reason,
+            message=message,
+            replacement_message=sentMsg,
+            prefix_message=prefixMsg,
+            message_hidden=explicit,
+            message_deleted=False
+        )
+
+        await asyncio.gather(*(report.send_to_channel(channel, assignable=True) for channel in self.mod_channels.values()))
 
     async def reject_user_message(self, message, explicit=False, reason=None):
         await (message.author.dm_channel or await message.author.create_dm()).send(content="Thank you for taking the time to reconsider your message.")
         self.reviewing_messages[message.author.id] = False
+
+    async def send_report(self, report, channels=None, allow_assignment=True):
+        embed = report.as_embed()
+
+        if allow_assignment:
+            assignReaction = Reaction("✋", click_handler=lambda self, client, reaction, user: report.assign_to(user))
+
+        for channel in (channels or self.client.mod_channels.values()):
+            message = await channel.send(embed=embed)
+            await assignReaction.registerMessage(message)
 
 
 client = ModBot(perspective_key)

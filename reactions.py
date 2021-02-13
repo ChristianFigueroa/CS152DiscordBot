@@ -27,7 +27,6 @@ class Reaction():
 			raise TypeError("handlers must be a callable or list of callables")
 
 		self.once_per_message = once_per_message
-
 		self._registeredMessages = []
 
 	# Attaches the reaction to a specified message and adds it to _registeredMessages
@@ -57,9 +56,9 @@ class ReactionDelegator():
 			if regmsg[0] == reaction.message:
 				if regmsg[1].reaction == reaction.emoji:
 					for handler in regmsg[1].click_handlers:
-						asyncio.create_task(handler(discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(discordClient, reaction, user)
+						asyncio.create_task(handler(regmsg[1], discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(regmsg[1], discordClient, reaction, user)
 					for handler in regmsg[1].toggle_handlers:
-						asyncio.create_task(handler(discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(discordClient, reaction, user)
+						asyncio.create_task(handler(regmsg[1], discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(regmsg[1], discordClient, reaction, user)
 				if regmsg[1].once_per_message:
 					removeAfter.append(regmsg)
 		for regmsg in removeAfter:
@@ -72,8 +71,8 @@ class ReactionDelegator():
 		for regmsg in _registeredMessages:
 			if regmsg[0] == reaction.message and regmsg[1].reaction == reaction.emoji:
 				for handler in regmsg[1].unclick_handlers:
-					asyncio.create_task(handler(discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(discordClient, reaction, user)
+					asyncio.create_task(handler(regmsg[1], discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(regmsg[1], discordClient, reaction, user)
 				for handler in regmsg[1].toggle_handlers:
-					asyncio.create_task(handler(discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(discordClient, reaction, user)
+					asyncio.create_task(handler(regmsg[1], discordClient, reaction, user)) if asyncio.iscoroutinefunction(handler) else handler(regmsg[1], discordClient, reaction, user)
 
 _registeredMessages = []
