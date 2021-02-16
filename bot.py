@@ -8,9 +8,8 @@ import re
 import requests
 import asyncio
 from textwrap import dedent
-from report import OpenUserReport, Report, AutomatedReport, AbuseType
+from report import UserReportCreationFlow, AutomatedReport, AbuseType, START_KEYWORDS, HELP_KEYWORDS, YES_KEYWORDS, NO_KEYWORDS
 from reactions import Reaction, ReactionDelegator
-from helpers import YES_KEYWORDS, NO_KEYWORDS
 
 
 # Controls whether messages in DMs with the bot should also be monitored
@@ -46,8 +45,9 @@ class ModBot(discord.Client, ReactionDelegator):
         self.user_reports = {} # Map from user IDs to the state of their report
         self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
         self.perspective_key = key
-        self.pending_reports = {} # Map from user IDs to a report they are reviewing
-
+        self.pending_reports = {}
+        self.message_aliases = {}
+        self.message_pairs = {}
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is in these guilds:')
@@ -103,48 +103,30 @@ class ModBot(discord.Client, ReactionDelegator):
         if self.pending_reports.get(author_id, False):
             return await self.pending_reports[author_id].forward_message(message)
 
-        # If the previous report was already completed, remove it from our map
-        if author_id in self.user_reports and self.user_reports[author_id].report_complete():
-            self.user_reports.pop(author_id)
+        # Check if the user has an open report associated with them
+        if author_id in self.user_reports:
+            return await self.user_reports[author_id].forward_message(message)
 
-        # Check if the user does not already have a report associated with them
-        if author_id not in self.user_reports:
-            # Handle a help message
-            if content.lower() in OpenUserReport.HELP_KEYWORDS:
-                await message.channel.send(dedent("""
-                    Use the `report` command to begin the reporting process.
-                """))
-                return
+        # Handle a report message
+        if content.lower() in START_KEYWORDS:
+            # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
+            message.author.dm_channel or await message.author.create_dm()
+            # Start a new UserReportCreationFlow
+            self.user_reports[author_id] = UserReportCreationFlow(self, message.author)
+            return
+        
+        # Handle a help message
+        if content.lower() in HELP_KEYWORDS:
+            await message.channel.send("Use the `report` command to begin the reporting process.")
+            return
 
-            # Tell the user how to start a new report
-            if content.lower() not in OpenUserReport.START_KEYWORDS:
-                await message.channel.send(dedent("""
-                    You do not have a report open; use the `report` command to begin the reporting process, or `help` for more help.
-                """))
-                # Filter this message if FILTER_DMS is on
-                if FILTER_DMS:
-                    await self.handle_channel_message(message)
-                return
-
-            # Start a new OpenUserReport
-            self.user_reports[author_id] = OpenUserReport(self, message.author)
-
-
-        # Let the report class handle this message; forward all the messages it returns to us
-        try:
-            responses = await self.user_reports[author_id].handle_message(message)
-        except Exception as e:
-            await message.channel.send("Uh oh! There was a problem in the code! Check the console for more information.")
-            raise e
-
-        lastMessage = None
-        for response in responses:
-            if isinstance(response, Reaction):
-                asyncio.create_task(response.registerMessage(lastMessage))
-            elif isinstance(response, discord.Embed):
-                lastMessage = await message.channel.send(embed=response)
-            else:
-                lastMessage = await message.channel.send(content=response)
+        # Tell the user how to start a new report
+        if content.lower() not in START_KEYWORDS:
+            await message.channel.send("You do not have a report open; use the `report` command to begin the reporting process, or use `help` for more help.")
+            # Filter this message if FILTER_DMS is on
+            if FILTER_DMS:
+                await self.handle_channel_message(message)
+            return
 
 
     async def handle_channel_message(self, message):
@@ -254,7 +236,7 @@ class ModBot(discord.Client, ReactionDelegator):
             click_handler=lambda self, client, reaction, user: \
                 client.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
                 asyncio.create_task(client.allow_user_message(**client.reviewing_messages[user.id]))
-        ).registerMessage(lastMsg)
+        ).register_message(lastMsg)
 
         # Add a No Reaction to prevent sending the message
         # Saying the word `no` does the same thing
@@ -263,7 +245,7 @@ class ModBot(discord.Client, ReactionDelegator):
             click_handler=lambda self, client, reaction, user: \
                 client.reviewing_messages.get(user.id, False) is confirmUserMessageSession and \
                 asyncio.create_task(client.reject_user_message(**client.reviewing_messages[user.id])) 
-        ).registerMessage(lastMsg)
+        ).register_message(lastMsg)
 
     async def allow_user_message(self, message, explicit=False, reason=None):
         # This is run when a user decides to send a message that the bot flagged.
@@ -274,10 +256,10 @@ class ModBot(discord.Client, ReactionDelegator):
         sentMsg = None
         prefixMsg = None
 
-        # An "explicit" message is show in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
+        # An "explicit" message is shown in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
         if explicit:
             content = message.content
-            # This alters the message slightly to disallow clever mardown formatting from getting through the spoiler
+            # This alters the message slightly to disallow clever markdown formatting from getting through the spoiler
             # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
             reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
             while reMatch:
@@ -316,6 +298,12 @@ class ModBot(discord.Client, ReactionDelegator):
         )
         self.reviewing_messages[message.author.id] = False
 
+        self.message_aliases[prefixMsg.id] = message
+        self.message_aliases[sentMsg.id] = message
+
+        self.message_pairs[sentMsg.id] = prefixMsg
+        self.message_pairs[prefixMsg.id] = sentMsg
+
         if reason:
             urgency = {
                 AbuseType.SPAM: 0,
@@ -342,16 +330,6 @@ class ModBot(discord.Client, ReactionDelegator):
     async def reject_user_message(self, message, explicit=False, reason=None):
         await (message.author.dm_channel or await message.author.create_dm()).send(content="Thank you for taking the time to reconsider your message.")
         self.reviewing_messages[message.author.id] = False
-
-    async def send_report(self, report, channels=None, allow_assignment=True):
-        embed = report.as_embed()
-
-        if allow_assignment:
-            assignReaction = Reaction("✋", click_handler=lambda self, client, reaction, user: report.assign_to(user))
-
-        for channel in (channels or self.client.mod_channels.values()):
-            message = await channel.send(embed=embed)
-            await assignReaction.registerMessage(message)
 
 
 client = ModBot(perspective_key)

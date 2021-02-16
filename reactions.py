@@ -30,7 +30,7 @@ class Reaction():
 		self._registeredMessages = []
 
 	# Attaches the reaction to a specified message and adds it to _registeredMessages
-	async def registerMessage(self, message):
+	async def register_message(self, message):
 		try:
 			await message.add_reaction(self.reaction)
 		except Exception as e:
@@ -39,7 +39,7 @@ class Reaction():
 		self._registeredMessages.append(registeredMessage)
 		_registeredMessages.append(registeredMessage)
 
-	async def unregisterMessage(self, client, message):
+	async def unregister_message(self, client, message):
 		await message.remove_reaction(self.reaction, client.user)
 		for regmsg in _registeredMessages:
 			if regmsg[0] == message and regmsg[1] == self:
@@ -62,7 +62,7 @@ class ReactionDelegator():
 				if regmsg[1].once_per_message:
 					removeAfter.append(regmsg)
 		for regmsg in removeAfter:
-			asyncio.create_task(regmsg[1].unregisterMessage(discordClient, regmsg[0]))
+			asyncio.create_task(regmsg[1].unregister_message(discordClient, regmsg[0]))
 
 
 	async def on_reaction_remove(discordClient, reaction, user):
