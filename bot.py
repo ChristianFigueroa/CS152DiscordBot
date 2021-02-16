@@ -8,7 +8,7 @@ import re
 import requests
 import asyncio
 from textwrap import dedent
-from report import UserReportCreationFlow, AutomatedReport, AbuseType, START_KEYWORDS, HELP_KEYWORDS, YES_KEYWORDS, NO_KEYWORDS
+from report import UserReportCreationFlow, EditedBadMessageFlow, AutomatedReport, AbuseType, START_KEYWORDS, HELP_KEYWORDS, YES_KEYWORDS, NO_KEYWORDS
 from reactions import Reaction, ReactionDelegator
 
 
@@ -41,6 +41,8 @@ class ModBot(discord.Client, ReactionDelegator):
         intents.members = True
         super().__init__(command_prefix='.', intents=intents)
         self.group_num = None   
+        self.flows = {}
+        self.messages_pending_edit = {}
         self.mod_channels = {} # Map from guild to the mod channel id for that guild
         self.user_reports = {} # Map from user IDs to the state of their report
         self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
@@ -83,11 +85,60 @@ class ModBot(discord.Client, ReactionDelegator):
         else:
             await self.handle_dm(message)
 
+    async def on_raw_message_edit(self, payload):
+        # Try to get the guild ID
+        guild_id = payload.data.get("guild_id", None)
+        if guild_id is None:
+            return
+
+        message = await self.get_guild(int(guild_id)).get_channel(payload.channel_id).fetch_message(payload.message_id)
+
+        if message.content.strip() == "":
+            return
+
+        scores = self.eval_text(message)
+
+        if payload.message_id in self.messages_pending_edit:
+            return await self.messages_pending_edit[payload.message_id].edited(message)
+
+        if scores["SPAM"] > 0.8:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM)
+
+        if scores["THREAT"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE)
+        elif scores["THREAT"] > 0.75:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE)
+
+        if scores["IDENTITY_ATTACK"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL)
+        elif scores["IDENTITY_ATTACK"] > 0.75:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL)
+
+        if scores["SEVERE_TOXICITY"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
+        elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS)
+
+    async def notify_user_edit_message(self, message, explicit=False, reason=None):
+        message.author.dm_channel or await message.author.create_dm()
+        flow = EditedBadMessageFlow(
+            client=self,
+            message=message,
+            explicit=explicit,
+            reason=reason
+        )
+        self.messages_pending_edit[message.id] = flow
+        self.flows[message.author.id] = self.flows.get(message.author.id, [])
+        self.flows[message.author.id].append(flow)
+
     async def handle_dm(self, message):
         content = message.content.strip()
 
         author_id = message.author.id
         responses = []
+
+        if len(self.flows[message.author.id]):
+            return await self.flows[message.author.id][-1].forward_message(message)
 
         # Check if the user is currently reviewing one of their own messages
         if self.reviewing_messages.get(author_id, False):
@@ -136,8 +187,6 @@ class ModBot(discord.Client, ReactionDelegator):
 
         scores = self.eval_text(message)
 
-        # await (message.author.dm_channel or await message.author.create_dm()).send(content="```" + json.dumps(scores, indent=2) + "```")
-
         if scores["SPAM"] > 0.8:
             return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
 
@@ -165,7 +214,9 @@ class ModBot(discord.Client, ReactionDelegator):
 
         url = PERSPECTIVE_URL + '?key=' + self.perspective_key
         data_dict = {
-            'comment': {'text': message.content},
+            'comment': {
+                'text': message.content
+            },
             'languages': ['en'],
             'requestedAttributes': {
                 'SEVERE_TOXICITY': {},

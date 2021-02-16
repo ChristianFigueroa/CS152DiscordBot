@@ -4,9 +4,8 @@ import re
 import asyncio
 import time
 from reactions import Reaction
-from collections import OrderedDict
-from difflib import SequenceMatcher
 from textwrap import dedent as _dedent
+from contextlib import suppress
 
 HELP_KEYWORDS = ("help", "?")
 CANCEL_KEYWORDS = ("cancel", "quit", "exit")
@@ -647,6 +646,136 @@ class Flow():
                 return msgs if message.lower() in HELP_KEYWORDS else func(self, message, *args, **kwargs)
             return asyncinnerwrapper if asyncio.iscoroutinefunction(func) else innerwrapper
         return wrapper
+
+
+class EditedBadMessageFlow(Flow):
+    State = Enum("EditedBadMessageFlowState", (
+        "START",
+        "RESEND",
+        "UNACCEPTABLE_EDIT",
+        "ACCEPTABLE_EDIT",
+        "TIME_EXPIRED"
+    ))
+    def __init__(self, client, message, explicit=False, reason=None, expiration_time=10 * 60):
+        super().__init__(channel=message.author.dm_channel, start_state=EditedBadMessageFlow.State.START)
+        self.client = client
+        self.author = message.author
+        self.message = message
+        self.explicit = explicit
+        self.reason = reason
+        self.second_timer = asyncio.ensure_future(self._second_timer())
+        self.time_elapsed = 0
+        self.expiration_time = expiration_time
+        self.second_timer_cancelled = False
+        self.timer_message = None
+
+    def timer_embed(self):
+        seconds_left = self.expiration_time - self.time_elapsed
+        color = discord.Color.green() if seconds_left > self.expiration_time * 0.5 else \
+            discord.Color.gold () if seconds_left > self.expiration_time * 0.2 else \
+            discord.Color.orange() if seconds_left > self.expiration_time * 0.075 else \
+            discord.Color.red()
+        minutes_left, seconds_left = divmod(seconds_left, 60)
+        return discord.Embed(
+            description = "{:02}:{:02}".format(minutes_left, seconds_left),
+            color=color
+        )
+
+    async def _second_timer(self):
+        while not self.second_timer_cancelled:
+            await asyncio.sleep(1)
+            self.time_elapsed += 1
+            if self.timer_message:
+                try:
+                    await self.timer_message.edit(embed=self.timer_embed())
+                except discord.errorsNotFound:
+                    self.timer_message = None
+            if self.time_elapsed >= self.expiration_time:
+                await self.transition_to_state(EditedBadMessageFlow.State.TIME_EXPIRED)
+
+    async def time_expired(self, message, simulated=False, introducing=False):
+        self.second_timer.cancel()
+        self.second_timer_cancelled = True
+        with suppress(asyncio.CancelledError):
+            await self.second_timer
+        await self.message.delete()
+        await self.close()
+        await self.say("Your edited message was deleted due to inaction.")
+
+    @Flow.help_message("Either say `re-send` to have the bot re-send your newly edited message, or make another edit to your message to something less inappropriate. If no action is taken within ten minutes, the message will be deleted.")
+    async def start(self, message, simulated=False, introducing=False):
+        if introducing:
+            if self.reason:
+                textReason = {
+                    AbuseType.SPAM: " as spam",
+                    AbuseType.VIOLENCE: " for inciting violence",
+                    AbuseType.HATEFUL: " as hateful",
+                    AbuseType.HARASS: " as toxic",
+                }[self.reason]
+            else:
+                textReason = ""
+            await self.say((
+                f"Your edited message below has been flagged{textReason}.",
+                discord.Embed(
+                    description=f"[Jump to message]({self.message.jump_url})\n{self.message.content}",
+                    color=discord.Color.blurple()
+                ).set_author(name=self.author.display_name, icon_url=self.author.avatar_url),
+                """
+                    You have the option to either edit it back into something less inappropriate, or have the bot re-send your message with the new edit.
+                    Note however that the message will appear back at the bottom of the channel instead of where it is now.
+                """,
+                """
+                    You can re-edit it now if you wish to do that, or say `re-send` to have the bot re-send the message with this new edit. You can also push the button below to re-send it.
+                    If no action is taken within ten minutes, the bot will delete the message from the channel altogether.
+                """,
+                Reaction("🗨", click_handler=lambda *args: asyncio.create_task(self.transition_to_state(EditedBadMessageFlow.State.RESEND)))
+            ))
+            self.timer_message = await self.channel.send(embed=self.timer_embed())
+        else:
+            if message.lower() in ("resend", "re-send", "send"):
+                await self.transition_to_state(EditedBadMessageFlow.State.RESEND)
+            else:
+                return "Sorry, I didn't understand that. Say `re-send` to have the bot re-send your message, or make another to your edited message to something less inappropriate."
+
+    async def resend(self, message, simulated=False, introducing=False):
+        await self.message.delete()
+        await self.client.allow_user_message(self.message, self.explicit, self.reason)
+        await self.close()
+
+    async def edited(self, new_message):
+        self.message = new_message
+        scores = self.client.eval_text(self.message)
+
+        still_bad = False
+        if scores["SPAM"] > 0.8:
+            still_bad = True
+        elif scores["THREAT"] > 0.75:
+            still_bad = True
+        elif scores["IDENTITY_ATTACK"] > 0.75:
+            still_bad = True
+        elif scores["SEVERE_TOXICITY"] > 0.9:
+            still_bad = True
+        elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
+            still_bad = True
+
+        if still_bad:
+            await self.transition_to_state(EditedBadMessageFlow.State.UNACCEPTABLE_EDIT)
+        else:
+            await self.transition_to_state(EditedBadMessageFlow.State.ACCEPTABLE_EDIT)
+
+    async def unacceptable_edit(self, message, simulated=False, introducing=False):
+        self.state = EditedBadMessageFlow.State.START
+        return "The edit you just made to your message has still been flagged. Please make an edit to something less inappropriate, or say `re-send` to have the bot re-send your message."
+
+    async def acceptable_edit(self, message, simulated=False, introducing=False):
+        await self.close()
+        return "Your message has been edited to something less inappropriate. Thank you for taking the time to reconsider your message."
+
+    async def close(self):
+        await self.timer_message.delete()
+        self.timer_message = None
+        self.client.flows[self.author.id].remove(self)
+        del self.client.messages_pending_edit[self.message.id]
 
 
 # A Flow for creating and submitting new UserReports
