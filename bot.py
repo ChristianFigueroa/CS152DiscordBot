@@ -8,13 +8,20 @@ import re
 import requests
 import asyncio
 from textwrap import dedent
-from report import UserReportCreationFlow, EditedBadMessageFlow, AutomatedReport, AbuseType, START_KEYWORDS, HELP_KEYWORDS, YES_KEYWORDS, NO_KEYWORDS
+from report import *
 from reactions import Reaction, ReactionDelegator
+from time import time
 
 
 # Controls whether messages in DMs with the bot should also be monitored
-# This is option only applies when a user is not sending a report
+# This is for testing and is False by default
 FILTER_DMS = False
+
+# Controls whether message that are hidden behind spoilers should account for adversarial markdown formatting
+# Trying to "|| a message ||" behind spoilers leads to "|||| a message ||||" (i.e., the spoilers cancel each other out)
+# Turning this on will look for that and other markdown tricks for trying to get around spoilers
+# This is True by default
+SMART_SPOILERS = True
 
 
 # Set up logging to the console
@@ -47,9 +54,10 @@ class ModBot(discord.Client, ReactionDelegator):
         self.user_reports = {} # Map from user IDs to the state of their report
         self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
         self.perspective_key = key
-        self.pending_reports = {}
         self.message_aliases = {}
         self.message_pairs = {}
+        self.helpers = {}
+        self.last_messages = {}
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is in these guilds:')
@@ -78,6 +86,8 @@ class ModBot(discord.Client, ReactionDelegator):
         # Ignore messages from us 
         if message.author.id == self.user.id:
             return
+
+        self.last_messages[message.author.id] = time()
         
         # Check if this message was sent in a server ("guild") or if it's a DM
         if message.guild:
@@ -137,7 +147,10 @@ class ModBot(discord.Client, ReactionDelegator):
         author_id = message.author.id
         responses = []
 
-        if len(self.flows[message.author.id]):
+        # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
+        message.author.dm_channel or await message.author.create_dm()
+
+        if len(self.flows.get(message.author.id, [])):
             return await self.flows[message.author.id][-1].forward_message(message)
 
         # Check if the user is currently reviewing one of their own messages
@@ -150,20 +163,48 @@ class ModBot(discord.Client, ReactionDelegator):
                 await message.channel.send(content="I didn't understand that. Reply with either `yes` or `no`.")
             return
 
-        # Check if the user is a moderator currently reviewing a report
-        if self.pending_reports.get(author_id, False):
-            return await self.pending_reports[author_id].forward_message(message)
-
         # Check if the user has an open report associated with them
         if author_id in self.user_reports:
             return await self.user_reports[author_id].forward_message(message)
 
         # Handle a report message
         if content.lower() in START_KEYWORDS:
-            # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
-            message.author.dm_channel or await message.author.create_dm()
             # Start a new UserReportCreationFlow
             self.user_reports[author_id] = UserReportCreationFlow(self, message.author)
+            return
+
+        # Starts an AddHelpersFlow to add more helpers
+        if re.search(r"^(?:add\shelpers?|helpers?\sadd)$", content.lower()):
+            self.flows[message.author.id] = self.flows.get(message.author.id, [])
+            self.flows[message.author.id].append(AddHelpersFlow(
+                client=self,
+                user=message.author
+            ))
+            return
+
+        # Shows a list of helpers for the user
+        if re.search(r"^(?:list\shelpers?|helpers?\slist)$", content.lower()):
+            helpers = self.helpers.get(message.author.id, None)
+            if helpers is None or len(helpers) == 0:
+                await message.channel.send("You don't have any helpers. Say `add helpers` to add some!")
+                return
+            helpers = "\n".join(f" {i+1}. {helper.mention} – **{helper.display_name}**#{helper.discriminator}" for i, helper in enumerate(helpers))
+            await message.channel.send(f"Your helpers are:\n{helpers}\nSay `add helpers` or `remove helpers` to add or remove them.")
+            return
+
+        if re.search(r"^(?:(?:remove|delete)\shelpers?|helpers?\s(?:remove|delete))$", content.lower()):
+            if not self.helpers.get(message.author.id, False):
+                await message.channel.send("You don't have any helpers to remove. Say `add helpers` to add some!")
+                return
+            self.flows[message.author.id] = self.flows.get(message.author.id, [])
+            self.flows[message.author.id].append(RemoveHelpersFlow(
+                client=self,
+                user=message.author
+            ))
+            return
+
+        if re.search(r"^(?:helpers?(?:\shelp)?|help\shelpers?)$", content.lower()):
+            await message.channel.send("Say `add helpers` to add helpers, `list helpers` to list your current helpers, or `remove helpers` to remove helpers.")
             return
         
         # Handle a help message
@@ -172,12 +213,10 @@ class ModBot(discord.Client, ReactionDelegator):
             return
 
         # Tell the user how to start a new report
-        if content.lower() not in START_KEYWORDS:
-            await message.channel.send("You do not have a report open; use the `report` command to begin the reporting process, or use `help` for more help.")
-            # Filter this message if FILTER_DMS is on
-            if FILTER_DMS:
-                await self.handle_channel_message(message)
-            return
+        await message.channel.send("You do not have a report open; use the `report` command to begin the reporting process, or use `help` for more help.")
+        # Filter this message if FILTER_DMS is on
+        if FILTER_DMS:
+            await self.handle_channel_message(message)
 
 
     async def handle_channel_message(self, message):
@@ -187,23 +226,26 @@ class ModBot(discord.Client, ReactionDelegator):
 
         scores = self.eval_text(message)
 
-        if scores["SPAM"] > 0.8:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
-
-        if scores["THREAT"] > 0.9:
+        if scores["SEXUALLY_EXPLICIT"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL)
+        elif scores["SEVERE_TOXICITY"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
+        elif scores["THREAT"] > 0.9:
             return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE)
+        elif scores["IDENTITY_ATTACK"] > 0.9:
+            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL)
+        elif scores["SEXUALLY_EXPLICIT"] > 0.75:
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SEXUAL)
         elif scores["THREAT"] > 0.75:
             return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE)
-
-        if scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL)
         elif scores["IDENTITY_ATTACK"] > 0.75:
             return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL)
-
-        if scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
         elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
             return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS)
+        elif scores["FLIRTATION"] > 0.8:
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
+        elif scores["SPAM"] > 0.8:
+            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
 
 
     def eval_text(self, message):
@@ -224,7 +266,9 @@ class ModBot(discord.Client, ReactionDelegator):
                 'INSULT': {},
                 'THREAT': {},
                 'TOXICITY': {},
-                'SPAM': {}
+                'SPAM': {},
+                'SEXUALLY_EXPLICIT': {},
+                'FLIRTATION': {}
             },
             'doNotStore': True
         }
@@ -238,7 +282,7 @@ class ModBot(discord.Client, ReactionDelegator):
         return scores
 
 
-    async def confirm_user_message(self, message, explicit=False, reason=None):
+    async def confirm_user_message(self, message, explicit=False, reason=None, explanation=""):
         # DMs a user asking if they are sure they want to send a message
         # explicit indicates whether the message should be hidden if they do decide to send it
         # reason is the reason for flagging the initial message (should be an AbuseType)
@@ -264,12 +308,15 @@ class ModBot(discord.Client, ReactionDelegator):
         )
         msgEmbed.set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
 
-        if reason:
+        if explanation:
+            textReason = " " + explanation
+        elif reason:
             textReason = {
                 AbuseType.SPAM: " as spam",
                 AbuseType.VIOLENCE: " for inciting violence",
                 AbuseType.HATEFUL: " as hateful",
                 AbuseType.HARASS: " as toxic",
+                AbuseType.SEXUAL: " as overtly sexual"
             }[reason]
         else:
             textReason = ""
@@ -359,6 +406,7 @@ class ModBot(discord.Client, ReactionDelegator):
             urgency = {
                 AbuseType.SPAM: 0,
                 AbuseType.VIOLENCE: 2,
+                AbuseType.SEXUAL: 1,
                 AbuseType.HATEFUL: 1,
                 AbuseType.HARASS: 1
             }[reason]
@@ -378,10 +426,39 @@ class ModBot(discord.Client, ReactionDelegator):
 
         await asyncio.gather(*(report.send_to_channel(channel, assignable=True) for channel in self.mod_channels.values()))
 
+        for member in origChannel.members:
+            now = time()
+            # Only look for users who have sent a message in the last hour
+            # this is to prevent spam for people who are offline
+            if member.id in self.last_messages:
+                if now - self.last_messages[member.id] > 60 * 60:
+                    # Remove them from the list of active users
+                    del self.last_messages[member.id]
+                else:
+                    await self.send_helper_message(member, sentMsg)
+
     async def reject_user_message(self, message, explicit=False, reason=None):
         await (message.author.dm_channel or await message.author.create_dm()).send(content="Thank you for taking the time to reconsider your message.")
         self.reviewing_messages[message.author.id] = False
 
+    async def send_helper_message(self, member, message):
+        if member.id not in self.helpers:
+            return
+        if message.id in self.message_aliases:
+            orig_message = self.message_aliases[message.id]
+            embed = discord.Embed(
+                color=discord.Color.blurple(),
+                description=f"[Jump to message]({message.jump_url})\n{orig_message.content}"
+            ).set_author(name=orig_message.author.display_name, icon_url=orig_message.author.avatar_url)
+        else:
+            embed = discord.Embed(
+                color=discord.Color.blurple(),
+                description=f"[Jump to message]({message.jump_url})\n{message.content}"
+            ).set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        for helper in self.helpers[member.id]:
+            channel = helper.dm_channel or await helper.create_dm()
+            await channel.send(content=f"{member.mention} wants you to review this message as one of their helpers:", embed=embed)
+            lastMsg = await channel.send(content="Do you want to start a user report for this message on the behalf.")
 
 client = ModBot(perspective_key)
 client.run(discord_token)

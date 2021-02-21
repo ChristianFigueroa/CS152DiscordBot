@@ -124,7 +124,7 @@ class Report():
     # Tries to assign a report to a user by checking if they are already assigned to another report
     # Used as a callback for Reaction click_handlers
     async def reaction_attempt_assign(self, reaction, discordClient, discordReaction, user):
-        if discordClient.pending_reports.get(user.id, None):
+        if any(map(lambda flow: isinstance(flow, AutomatedReportReviewFlow) or isinstance(flow, UserReportReviewFlow), discordClient.flows.get(user.id, []))):
             try:
                 await asyncio.gather(
                     # Remove the user's reaction
@@ -156,14 +156,15 @@ class Report():
         if moderator.dm_channel is None:
             await moderator.create_dm()
         self.review_flow = (AutomatedReportReviewFlow if isinstance(self, AutomatedReport) else UserReportReviewFlow)(self, moderator)
-        self.client.pending_reports[moderator.id] = self.review_flow
+        self.client.flows[moderator.id] = self.client.flows.get(moderator.id, [])
+        self.client.flows[moderator.id].append(self.review_flow)
 
     # Remove an assignee 
     def unassign(self):
         if self.assignee is None:
             return
         self.set_status(ReportStatus.NEW)
-        self.client.pending_reports[self.assignee.id] = None
+        self.client.flows[self.assignee.id].remove(self.review_flow)
         self.assignee = None
         self.review_flow = None
         assignReaction = Reaction("✋", click_handler=self.reaction_attempt_assign, once_per_message=False)
@@ -174,7 +175,7 @@ class Report():
     def resolve(self):
         self.resolution_time = time.localtime()
         self.set_status(ReportStatus.RESOLVED)
-        self.client.pending_reports[self.assignee.id] = None
+        self.client.flows[self.assignee.id].remove(self.review_flow)
         self.review_flow = None
         for msg in list(self._channel_messages):
             if msg[2]: # Check if message is self_destructible
@@ -216,7 +217,7 @@ class UserReport(Report):
             value=f"[Jump to message]({self.message.jump_url})\n"+self.message.content,
             inline=False
         )
-        if hasattr(self, "victim"):
+        if hasattr(self, "victim") and self.abuse_type in (AbuseType.HARASS, AbuseType.BULLYING):
             embed.add_field(name="Victim", value=(self.victim.mention + (" (Reporter)" if self.victim == self.author else "")) if self.victim else "*[Not specified]*", inline=False)
         embed.add_field(
             name="Requires Immediate Attention",
@@ -698,7 +699,10 @@ class EditedBadMessageFlow(Flow):
         self.second_timer_cancelled = True
         with suppress(asyncio.CancelledError):
             await self.second_timer
-        await self.message.delete()
+        try:
+            await self.message.delete()
+        except discord.errors.NotFound:
+            pass
         await self.close()
         await self.say("Your edited message was deleted due to inaction.")
 
@@ -776,6 +780,275 @@ class EditedBadMessageFlow(Flow):
         self.timer_message = None
         self.client.flows[self.author.id].remove(self)
         del self.client.messages_pending_edit[self.message.id]
+
+
+# A Flow for assigning users to be "helpers"
+class AddHelpersFlow(Flow):
+    State = Enum("AddHelpersFloeState", (
+        "HELPER_ADD_START",
+        "HELPER_ADD_QUIT",
+        "FINALIZE_LIST"
+    ))
+
+    def __init__(self, client, user):
+        super().__init__(channel=user.dm_channel, start_state=AddHelpersFlow.State.HELPER_ADD_START, quit_state=AddHelpersFlow.State.HELPER_ADD_QUIT)
+        self.client = client
+        self.user = user
+        self.helper_list = []
+
+    # Ask the user to supply the victimized user
+    @Flow.help_message("""
+        Type a username to search for them. The `@` at the beginning isn't necessary (since they won't appear in DMs).
+        You can also search by their nickname in a guild.
+    """)
+    async def helper_add_start(self, message, simulated=False, introducing=False):
+        if introducing:
+            return "Please enter the username of the person you want to add as a helper, or say `cancel` to cancel."
+        else:
+            if message.lower() == "done":
+                if len(self.helper_list):
+                    return await self.transition_to_state(AddHelpersFlow.State.FINALIZE_LIST)
+                else:
+                    return "You haven't added any new helpers yet. Say `cancel` to cancel."
+
+            if message[0] == "@":
+                message = message[1:]
+
+            # Get a list of guilds that both the bot and the user are both in
+            commonGuilds = []
+            for guild in self.client.guilds:
+                if discord.utils.get(guild.members, id=self.user.id) is not None:
+                    commonGuilds.append(guild)
+
+            # Parse out a discriminator if the name includes one
+            discrim = re.search(r"#\d+$", message)
+            if discrim is not None:
+                discrim = str(int(discrim.group(0)[1:]))
+                username = message[:-len(discrim) - 1]
+            else:
+                username = message
+
+            # Search each common guild for a user with the specified user name or display name.
+            for guild in commonGuilds:
+                # Filter out users if a discriminator was given
+                if discrim is not None:
+                    members = tuple(filter(lambda member: member.discriminator == discrim, guild.members))
+                else:
+                    members = guild.members
+
+                matches = set(filter(lambda member: member.name.lower() == username.lower(), members))
+                matches.update(filter(lambda member: member.display_name.lower() == username.lower(), members))
+                matches = tuple(matches)
+
+                # Check if we only got one result
+                if len(matches) == 1:
+                    member = matches[0]
+                    self.helper_list.append(member)
+                    return (
+                        discord.Embed(
+                            color=discord.Color.greyple(),
+                            description=f"You added {member.mention} – **{member.display_name}**#{member.discriminator} as a helper."
+                        ),
+                        "Add more members by specifying their username. Say `done` or press the checkmark below when you're done.",
+                        self.react_done()
+                    )
+
+                # Show that there were multiple users (ask for username AND discriminator)
+                elif len(matches) >= 2:
+                    matches = matches[:10]
+                    return (
+                        "There were multiple results for your search:\n" +
+                        "\n".join(f" {i+1}. {text}" for i, text in enumerate(map(lambda member: f"{member.mention} – **{member.display_name}**#{member.discriminator}", matches))) +
+                        f"\nPlease search using both the **Username** *and* #Discriminator (e.g., `{self.reporter.name}#{self.reporter.discriminator}`).",
+                    )
+
+                # Show that there were no results
+                else:
+                    return f"""
+                        I couldn't find any users with the user name `{message}`. Only users in guilds we are both a part of are searchable.
+                        Please try again or say `done` when you're done.
+                    """
+
+    @Flow.help_message("""
+        Specify whether you're ready to add these users to your list of reports.
+        You can type `yes` to proceed or `no` to add more users.
+    """)
+    async def finalize_list(self, message, simulated=False, introducing=False):
+        if introducing:
+            helpers = "\n".join(f" {i+1}. {helper.mention} – **{helper.display_name}**#{helper.discriminator}" for i, helper in enumerate(self.helper_list))
+            return (
+                "You are about to add these people to your list of helpers:\n" +
+                helpers +
+                "\nSay `yes` to continue or `no` to go back and add more people.",
+                self.react_yes(),
+                self.react_no()
+            )
+        else:
+            if message.lower() in YES_KEYWORDS:
+                helpers = set(self.client.helpers.get(self.user.id, []))
+                helpers.update(self.helper_list)
+                self.client.helpers[self.user.id] = list(helpers)
+                self.client.flows[self.user.id].remove(self)
+                return "You have successfully added the users to your list of helpers."
+            elif message.lower() in NO_KEYWORDS:
+                await self.transition_to_state(AddHelpersFlow.State.HELPER_ADD_START)
+            else:
+                return "Sorry, I didn't understand that; please say `yes` or `no`."
+
+    @Flow.help_message("""
+        Decide whether you really want to quit.
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def helper_add_quit(self, message, simulated=False, introducing=False, revert=None):
+        if introducing:
+            return (
+                "Are you sure you want to quit? Any helpers you've added so far will not be saved.",
+                self.react_yes(),
+                self.react_no()
+            )
+        else:
+            if message.lower() in YES_KEYWORDS:
+                self.client.flows[self.user.id].remove(self)
+                return "No helpers have were added."
+            elif message.lower() in NO_KEYWORDS:
+                await revert()
+            else:
+                return "Sorry, I didn't understand that. Please reply with `yes` or `no` or click one of the buttons above."
+
+
+# A Flow for removing users from your list of helpers
+class RemoveHelpersFlow(Flow):
+    State = Enum("RemoveHelpersFloeState", (
+        "HELPER_REMOVE_START",
+        "HELPER_REMOVE_QUIT",
+        "FINALIZE_LIST"
+    ))
+
+    def __init__(self, client, user):
+        super().__init__(channel=user.dm_channel, start_state=RemoveHelpersFlow.State.HELPER_REMOVE_START, quit_state=RemoveHelpersFlow.State.HELPER_REMOVE_QUIT)
+        self.client = client
+        self.user = user
+        self.helper_list = client.helpers.get(user.id, [])
+
+    # Ask the user to supply the victimized user
+    @Flow.help_message("Type the username of the helper you want to remove, or say `done` to finish.")
+    async def helper_remove_start(self, message, simulated=False, introducing=False):
+        if introducing:
+            if len(self.helper_list) == 0:
+                await self.say("You have no more helpers to remove.")
+                return await self.transition_to_state(RemoveHelpersFlow.State.FINALIZE_LIST)
+            else:
+                helpers = "\n".join(f"{helper.mention} – **{helper.display_name}**#{helper.discriminator}" for helper in self.helper_list)
+                helpers = helpers if len(helpers) > 0 else "*None!*"
+                return f"Your current helpers are:\n{helpers}\nType the username of the helper you want to remove, or say `cancel` to cancel."
+        else:
+            if message.lower() == "done":
+                return await self.transition_to_state(RemoveHelpersFlow.State.FINALIZE_LIST)
+
+            if message[0] == "@":
+                message = message[1:]
+
+            # Parse out a discriminator if the name includes one
+            discrim = re.search(r"#\d+$", message)
+            if discrim is not None:
+                discrim = str(int(discrim.group(0)[1:]))
+                username = message[:-len(discrim) - 1]
+            else:
+                username = message
+
+            # Filter out users if a discriminator was given
+            if discrim is not None:
+                members = tuple(filter(lambda member: member.discriminator == discrim, self.helper_list))
+            else:
+                members = self.helper_list
+
+            matches = set(filter(lambda member: member.name.lower() == username.lower(), members))
+            matches.update(filter(lambda member: member.display_name.lower() == username.lower(), members))
+            matches = tuple(matches)
+
+            # Check if we only got one result
+            if len(matches) == 1:
+                member = matches[0]
+                self.helper_list.remove(member)
+                if len(self.helper_list) == 0:
+                    await self.say((
+                        discord.Embed(
+                            color=discord.Color.greyple(),
+                            description=f"You removed {member.mention} from your list of helpers."
+                        ),
+                        "You have no more helpers in your list."
+                    ))
+                    await self.transition_to_state(RemoveHelpersFlow.State.FINALIZE_LIST)
+                else:
+                    return (
+                        discord.Embed(
+                            color=discord.Color.greyple(),
+                            description=f"You removed {member.mention} from your list of helpers."
+                        ),
+                        "Remove more members by specifying their username. Say `done` or press the checkmark below when you're done.",
+                        self.react_done()
+                    )
+
+            # Show that there were multiple users (ask for username AND discriminator)
+            elif len(matches) >= 2:
+                matches = matches[:10]
+                return (
+                    "There were multiple results for your search:\n" +
+                    "\n".join(f" {i+1}. {text}" for i, text in enumerate(map(lambda member: f"{member.mention} – **{member.display_name}**#{member.discriminator}", matches))) +
+                    f"\nPlease search using both the **Username** *and* #Discriminator (e.g., `{self.reporter.name}#{self.reporter.discriminator}`).",
+                )
+
+            # Show that there were no results
+            else:
+                return f"""
+                    I couldn't find any users with the user name `{message}`. Only users listed above will show up.
+                    Please try again or say `done` when you're done.
+                """
+
+    @Flow.help_message("""
+        Specify whether you're ready to update your list of helpers.
+        You can type `yes` to proceed or `no` to remove more users.
+    """)
+    async def finalize_list(self, message, simulated=False, introducing=False):
+        if introducing:
+            helpers = "\n".join(f" {i+1}. {member.mention} – **{member.display_name}**#{member.discriminator}" for i, member in enumerate(self.helper_list))
+            helpers = helpers if len(helpers) > 0 else "*None!*"
+            return (
+                "This will be your new list of helpers:\n" +
+                helpers +
+                "\nSay `yes` to continue or `no` to go back and remove more people.",
+                self.react_yes(),
+                self.react_no()
+            )
+        else:
+            if message.lower() in YES_KEYWORDS:
+                self.client.helpers[self.user.id] = self.helper_list
+                self.client.flows[self.user.id].remove(self)
+                return "You have successfully updated your list of helpers."
+            elif message.lower() in NO_KEYWORDS:
+                await self.transition_to_state(RemoveHelpersFlow.State.HELPER_REMOVE_START)
+            else:
+                return "Sorry, I didn't understand that; please say `yes` or `no`."
+
+    @Flow.help_message("""
+        Decide whether you really want to quit.
+        You can type `yes` or `no`, or select one of the buttons above.
+    """)
+    async def helper_remove_quit(self, message, simulated=False, introducing=False, revert=None):
+        if introducing:
+            return (
+                "Are you sure you want to quit? Any helpers you've removed so far will remain in your list.",
+                self.react_yes(),
+                self.react_no()
+            )
+        else:
+            if message.lower() in YES_KEYWORDS:
+                self.client.flows[self.user.id].remove(self)
+                return "No helpers have were removed."
+            elif message.lower() in NO_KEYWORDS:
+                await revert()
+            else:
+                return "Sorry, I didn't understand that. Please reply with `yes` or `no` or click one of the buttons above."
 
 
 # A Flow for creating and submitting new UserReports
@@ -1550,7 +1823,7 @@ class UserReportReviewFlow(Flow):
         await self.perform_action("unassign")
 
 
-# A subclass of UserRpoertReviewFlow specifically for handling Misinformation or Spam reports
+# A subclass of UserReportReviewFlow specifically for handling Misinformation or Spam reports
 class SpamUserReportReviewFlow(UserReportReviewFlow):
     # Show a message showing how spam messages should be handled, and then show the rest of review_start
     async def review_start(self, message, simulated=False, introducing=False):
