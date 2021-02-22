@@ -139,6 +139,7 @@ class ModBot(discord.Client, ReactionDelegator):
             return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM, explanation="as spam")
 
     async def notify_user_edit_message(self, message, explicit=False, reason=None, explanation=None):
+
         message.author.dm_channel or await message.author.create_dm()
         flow = EditedBadMessageFlow(
             client=self,

@@ -658,6 +658,7 @@ class EditedBadMessageFlow(Flow):
         "ACCEPTABLE_EDIT",
         "TIME_EXPIRED"
     ))
+                             
     def __init__(self, client, message, explicit=False, reason=None, explanation=None, expiration_time=10 * 60):
         super().__init__(channel=message.author.dm_channel, start_state=EditedBadMessageFlow.State.START)
         self.client = client
@@ -1452,7 +1453,7 @@ class UserReportCreationFlow(Flow):
             inline=False
         ).add_field(
             name="Message",
-            value=self.message.content,
+            value=self.message.content or "*[No text]*",
             inline=False
         )
         if hasattr(self, "victim"):
