@@ -19,9 +19,10 @@ FILTER_DMS = False
 
 # Controls whether message that are hidden behind spoilers should account for adversarial markdown formatting
 # Trying to "|| a message ||" behind spoilers leads to "|||| a message ||||" (i.e., the spoilers cancel each other out)
-# Turning this on will look for that and other markdown tricks for trying to get around spoilers
+# Turning this on will look for that and other markdown tricks (like ``` code blocks ```) for trying to get around spoilers
 # This is True by default
-SMART_SPOILERS = True
+SMART_SPOILERS = False
+# DM the bot .debug smart_spoilers enable/disable/toggle to turn them on and off
 
 
 # Set up logging to the console
@@ -43,6 +44,7 @@ with open(token_path) as f:
 
 
 class ModBot(discord.Client, ReactionDelegator):
+    smart_spoilers = SMART_SPOILERS
     def __init__(self, key):
         intents = discord.Intents.default()
         intents.members = True
@@ -111,31 +113,35 @@ class ModBot(discord.Client, ReactionDelegator):
         if payload.message_id in self.messages_pending_edit:
             return await self.messages_pending_edit[payload.message_id].edited(message)
 
-        if scores["SPAM"] > 0.8:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM)
-
-        if scores["THREAT"] > 0.9:
+        if scores["SEXUALLY_EXPLICIT"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.SEXUAL)
+        elif scores["SEVERE_TOXICITY"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HARASS)
+        elif scores["THREAT"] > 0.9:
             return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE)
+        elif scores["IDENTITY_ATTACK"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL)
+        elif scores["SEXUALLY_EXPLICIT"] > 0.75:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SEXUAL)
         elif scores["THREAT"] > 0.75:
             return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE)
-
-        if scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL)
         elif scores["IDENTITY_ATTACK"] > 0.75:
             return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL)
-
-        if scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
         elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
             return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS)
+        elif scores["FLIRTATION"] > 0.8:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
+        elif scores["SPAM"] > 0.8:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM)
 
-    async def notify_user_edit_message(self, message, explicit=False, reason=None):
+    async def notify_user_edit_message(self, message, explicit=False, reason=None, explanation=""):
         message.author.dm_channel or await message.author.create_dm()
         flow = EditedBadMessageFlow(
             client=self,
             message=message,
             explicit=explicit,
-            reason=reason
+            reason=reason,
+            explanation=explanation
         )
         self.messages_pending_edit[message.id] = flow
         self.flows[message.author.id] = self.flows.get(message.author.id, [])
@@ -149,6 +155,20 @@ class ModBot(discord.Client, ReactionDelegator):
 
         # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
         message.author.dm_channel or await message.author.create_dm()
+
+        # Handle smart_spoilers
+        if content.lower() == ".debug smart_spoilers toggle":
+            self.smart_spoilers = not self.smart_spoilers
+            await message.channel.send(embed=discord.Embed(description=f"Smart spoilers have been {'enabled' if self.smart_spoilers else 'disabled'}."))
+            return
+        if content.lower() == ".debug smart_spoilers enable":
+            self.smart_spoilers = True
+            await message.channel.send(embed=discord.Embed(description="Smart spoilers have been enabled."))
+            return
+        if content.lower() == ".debug smart_spoilers disable":
+            self.smart_spoilers = False
+            await message.channel.send(embed=discord.Embed(description="Smart spoilers have been disabled."))
+            return
 
         if len(self.flows.get(message.author.id, [])):
             return await self.flows[message.author.id][-1].forward_message(message)
@@ -223,6 +243,9 @@ class ModBot(discord.Client, ReactionDelegator):
         # Only handle messages sent in the "group-#" channel or DMs
         if not (FILTER_DMS and isinstance(message.channel, discord.DMChannel)) and message.channel.name != f'group-{self.group_num}':
            return
+
+        if message.content.strip() == "":
+            return
 
         scores = self.eval_text(message)
 
@@ -357,26 +380,28 @@ class ModBot(discord.Client, ReactionDelegator):
         # An "explicit" message is shown in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
         if explicit:
             content = message.content
-            # This alters the message slightly to disallow clever markdown formatting from getting through the spoiler
-            # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
-            reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
-            while reMatch:
-                code = reMatch.group(1).split("\n")
-                longestLine = max(map(lambda line: len(line), code))
-                code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
-                content = content[:reMatch.start()] + code + content[reMatch.end():]
+
+            if self.smart_spoilers:
+                # This alters the message slightly to disallow clever markdown formatting from getting through the spoiler
+                # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
                 reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
+                while reMatch:
+                    code = reMatch.group(1).split("\n")
+                    longestLine = max(map(lambda line: len(line), code))
+                    code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
+                    content = content[:reMatch.start()] + code + content[reMatch.end():]
+                    reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
 
-            # Now, any "||" in code blocks are converted to a look-alike (by inserting a zero-width space in between them)
-            # This is to prevent them from being recognized as closing spoiler elements
-            # Outside of code blocks, we can just escape the double bars with a "\|" but code blocks will show the literal "\"
-            reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
-            while reMatch:
-                content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                # Now, any "||" in code blocks are converted to a look-alike (by inserting a zero-width space in between them)
+                # This is to prevent them from being recognized as closing spoiler elements
+                # Outside of code blocks, we can just escape the double bars with a "\|" but code blocks will show the literal "\"
                 reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
+                while reMatch:
+                    content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                    reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
 
-            # Remove any remaining spoiler tags in the comment by escaping each "|"
-            content = content.replace("||", "\\|\\|")
+                # Remove any remaining spoiler tags in the comment by escaping each "|"
+                content = content.replace("||", "\\|\\|")
 
             # Send a message to show who this message is from
             prefixMsg = await origChannel.send(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{message.author.mention} says:*")

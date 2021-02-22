@@ -439,20 +439,21 @@ class AutomatedReport(Report):
 
         # This code is taken from ModBot.allow_user_message
         content = self.message.content
-        reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
-        while reMatch:
-            code = reMatch.group(1).split("\n")
-            longestLine = max(map(lambda line: len(line), code))
-            code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
-            content = content[:reMatch.start()] + code + content[reMatch.end():]
+        if self.client.smart_spoilers:
             reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
+            while reMatch:
+                code = reMatch.group(1).split("\n")
+                longestLine = max(map(lambda line: len(line), code))
+                code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
+                content = content[:reMatch.start()] + code + content[reMatch.end():]
+                reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
 
-        reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
-        while reMatch:
-            content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
             reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
+            while reMatch:
+                content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
 
-        content = content.replace("||", "\\|\\|")
+            content = content.replace("||", "\\|\\|")
         try:
             await asyncio.gather(
                 self.prefix_message.edit(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{self.message.author.mention} says:*"),
@@ -657,13 +658,14 @@ class EditedBadMessageFlow(Flow):
         "ACCEPTABLE_EDIT",
         "TIME_EXPIRED"
     ))
-    def __init__(self, client, message, explicit=False, reason=None, expiration_time=10 * 60):
+    def __init__(self, client, message, explicit=False, reason=None, explanation="", expiration_time=10 * 60):
         super().__init__(channel=message.author.dm_channel, start_state=EditedBadMessageFlow.State.START)
         self.client = client
         self.author = message.author
         self.message = message
         self.explicit = explicit
         self.reason = reason
+        self.explanation = explanation
         self.second_timer = asyncio.ensure_future(self._second_timer())
         self.time_elapsed = 0
         self.expiration_time = expiration_time
@@ -709,7 +711,9 @@ class EditedBadMessageFlow(Flow):
     @Flow.help_message("Either say `re-send` to have the bot re-send your newly edited message, or make another edit to your message to something less inappropriate. If no action is taken within ten minutes, the message will be deleted.")
     async def start(self, message, simulated=False, introducing=False):
         if introducing:
-            if self.reason:
+            if self.explanation:
+                textReason = " " + self.explanation
+            elif self.reason:
                 textReason = {
                     AbuseType.SPAM: " as spam",
                     AbuseType.VIOLENCE: " for inciting violence",
@@ -776,7 +780,8 @@ class EditedBadMessageFlow(Flow):
         return "Your message has been edited to something less inappropriate. Thank you for taking the time to reconsider your message."
 
     async def close(self):
-        await self.timer_message.delete()
+        if self.timer_message is not None:
+            await self.timer_message.delete()
         self.timer_message = None
         self.client.flows[self.author.id].remove(self)
         del self.client.messages_pending_edit[self.message.id]
@@ -1456,7 +1461,7 @@ class UserReportCreationFlow(Flow):
             inline=False
         ).add_field(
             name="Message",
-            value=self.message.content,
+            value=self.message.content or "*[No text]*",
             inline=False
         )
         if hasattr(self, "victim"):
