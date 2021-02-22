@@ -8,13 +8,23 @@ import re
 import requests
 import asyncio
 from textwrap import dedent
-from report import UserReportCreationFlow, EditedBadMessageFlow, AutomatedReport, AbuseType, START_KEYWORDS, HELP_KEYWORDS, YES_KEYWORDS, NO_KEYWORDS
+from report import *
 from reactions import Reaction, ReactionDelegator
+from time import time
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from msrest.authentication import CognitiveServicesCredentials
 
 
 # Controls whether messages in DMs with the bot should also be monitored
-# This is option only applies when a user is not sending a report
+# This is for testing and is False by default
 FILTER_DMS = False
+
+# Controls whether message that are hidden behind spoilers should account for adversarial markdown formatting
+# Trying to "|| a message ||" behind spoilers leads to "|||| a message ||||" (i.e., the spoilers cancel each other out)
+# Turning this on will look for that and other markdown tricks (like ``` code blocks ```) for trying to get around spoilers
+# This is True by default
+SMART_SPOILERS = True
+# DM the bot .debug smart_spoilers enable/disable/toggle to turn them on and off
 
 
 # Set up logging to the console
@@ -33,9 +43,11 @@ with open(token_path) as f:
     tokens = json.load(f)
     discord_token = tokens['discord']
     perspective_key = tokens['perspective']
-
+    azure_key = tokens["azure"]
+    azure_endpoint = tokens["azure_endpoint"]
 
 class ModBot(discord.Client, ReactionDelegator):
+    smart_spoilers = SMART_SPOILERS
     def __init__(self, key):
         intents = discord.Intents.default()
         intents.members = True
@@ -47,9 +59,11 @@ class ModBot(discord.Client, ReactionDelegator):
         self.user_reports = {} # Map from user IDs to the state of their report
         self.reviewing_messages = {} # Map from user IDs to a boolean indicating if they are reviewing content
         self.perspective_key = key
-        self.pending_reports = {}
         self.message_aliases = {}
         self.message_pairs = {}
+        self.helpers = {}
+        self.last_messages = {}
+        self.computervision_client = ComputerVisionClient(azure_endpoint, CognitiveServicesCredentials(azure_key))
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is in these guilds:')
@@ -78,6 +92,8 @@ class ModBot(discord.Client, ReactionDelegator):
         # Ignore messages from us 
         if message.author.id == self.user.id:
             return
+
+        self.last_messages[message.author.id] = time()
         
         # Check if this message was sent in a server ("guild") or if it's a DM
         if message.guild:
@@ -101,31 +117,35 @@ class ModBot(discord.Client, ReactionDelegator):
         if payload.message_id in self.messages_pending_edit:
             return await self.messages_pending_edit[payload.message_id].edited(message)
 
-        if scores["SPAM"] > 0.8:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM)
-
-        if scores["THREAT"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE)
+        if scores["SEXUALLY_EXPLICIT"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
+        elif scores["SEVERE_TOXICITY"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HARASS, explanation="as toxic")
+        elif scores["THREAT"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as threatening")
+        elif scores["IDENTITY_ATTACK"] > 0.9:
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL, explanation="as hateful")
+        elif scores["SEXUALLY_EXPLICIT"] > 0.75:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
         elif scores["THREAT"] > 0.75:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE)
-
-        if scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="for inciting violence")
         elif scores["IDENTITY_ATTACK"] > 0.75:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL)
-
-        if scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL, explanation="as hateful")
         elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as toxic")
+        elif scores["FLIRTATION"] > 0.8:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
+        elif scores["SPAM"] > 0.8:
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM, explanation="as spam")
 
-    async def notify_user_edit_message(self, message, explicit=False, reason=None):
+    async def notify_user_edit_message(self, message, explicit=False, reason=None, explanation=None):
         message.author.dm_channel or await message.author.create_dm()
         flow = EditedBadMessageFlow(
             client=self,
             message=message,
             explicit=explicit,
-            reason=reason
+            reason=reason,
+            explanation=explanation
         )
         self.messages_pending_edit[message.id] = flow
         self.flows[message.author.id] = self.flows.get(message.author.id, [])
@@ -137,7 +157,24 @@ class ModBot(discord.Client, ReactionDelegator):
         author_id = message.author.id
         responses = []
 
-        if len(self.flows[message.author.id]):
+        # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
+        message.author.dm_channel or await message.author.create_dm()
+
+        # Handle smart_spoilers
+        if content.lower() == ".debug smart_spoilers toggle":
+            self.smart_spoilers = not self.smart_spoilers
+            await message.channel.send(embed=discord.Embed(description=f"Smart spoilers have been {'enabled' if self.smart_spoilers else 'disabled'}."))
+            return
+        if content.lower() == ".debug smart_spoilers enable":
+            self.smart_spoilers = True
+            await message.channel.send(embed=discord.Embed(description="Smart spoilers have been enabled."))
+            return
+        if content.lower() == ".debug smart_spoilers disable":
+            self.smart_spoilers = False
+            await message.channel.send(embed=discord.Embed(description="Smart spoilers have been disabled."))
+            return
+
+        if len(self.flows.get(message.author.id, [])):
             return await self.flows[message.author.id][-1].forward_message(message)
 
         # Check if the user is currently reviewing one of their own messages
@@ -150,20 +187,48 @@ class ModBot(discord.Client, ReactionDelegator):
                 await message.channel.send(content="I didn't understand that. Reply with either `yes` or `no`.")
             return
 
-        # Check if the user is a moderator currently reviewing a report
-        if self.pending_reports.get(author_id, False):
-            return await self.pending_reports[author_id].forward_message(message)
-
         # Check if the user has an open report associated with them
         if author_id in self.user_reports:
             return await self.user_reports[author_id].forward_message(message)
 
         # Handle a report message
         if content.lower() in START_KEYWORDS:
-            # Ensure there is a DM channel between us and the user (which there should be since we are handling a DM message, but just in case)
-            message.author.dm_channel or await message.author.create_dm()
             # Start a new UserReportCreationFlow
             self.user_reports[author_id] = UserReportCreationFlow(self, message.author)
+            return
+
+        # Starts an AddHelpersFlow to add more helpers
+        if re.search(r"^(?:add\shelpers?|helpers?\sadd)$", content.lower()):
+            self.flows[message.author.id] = self.flows.get(message.author.id, [])
+            self.flows[message.author.id].append(AddHelpersFlow(
+                client=self,
+                user=message.author
+            ))
+            return
+
+        # Shows a list of helpers for the user
+        if re.search(r"^(?:list\shelpers?|helpers?\slist)$", content.lower()):
+            helpers = self.helpers.get(message.author.id, None)
+            if helpers is None or len(helpers) == 0:
+                await message.channel.send("You don't have any helpers. Say `add helpers` to add some!")
+                return
+            helpers = "\n".join(f" {i+1}. {helper.mention} – **{helper.display_name}**#{helper.discriminator}" for i, helper in enumerate(helpers))
+            await message.channel.send(f"Your helpers are:\n{helpers}\nSay `add helpers` or `remove helpers` to add or remove them.")
+            return
+
+        if re.search(r"^(?:(?:remove|delete)\shelpers?|helpers?\s(?:remove|delete))$", content.lower()):
+            if not self.helpers.get(message.author.id, False):
+                await message.channel.send("You don't have any helpers to remove. Say `add helpers` to add some!")
+                return
+            self.flows[message.author.id] = self.flows.get(message.author.id, [])
+            self.flows[message.author.id].append(RemoveHelpersFlow(
+                client=self,
+                user=message.author
+            ))
+            return
+
+        if re.search(r"^(?:helpers?(?:\shelp)?|help\shelpers?)$", content.lower()):
+            await message.channel.send("Say `add helpers` to add helpers, `list helpers` to list your current helpers, or `remove helpers` to remove helpers.")
             return
         
         # Handle a help message
@@ -172,12 +237,10 @@ class ModBot(discord.Client, ReactionDelegator):
             return
 
         # Tell the user how to start a new report
-        if content.lower() not in START_KEYWORDS:
-            await message.channel.send("You do not have a report open; use the `report` command to begin the reporting process, or use `help` for more help.")
-            # Filter this message if FILTER_DMS is on
-            if FILTER_DMS:
-                await self.handle_channel_message(message)
-            return
+        await message.channel.send("You do not have a report open; use the `report` command to begin the reporting process, or use `help` for more help.")
+        # Filter this message if FILTER_DMS is on
+        if FILTER_DMS:
+            await self.handle_channel_message(message)
 
 
     async def handle_channel_message(self, message):
@@ -185,31 +248,74 @@ class ModBot(discord.Client, ReactionDelegator):
         if not (FILTER_DMS and isinstance(message.channel, discord.DMChannel)) and message.channel.name != f'group-{self.group_num}':
            return
 
-        scores = self.eval_text(message)
+        # First filter through images since those are more likely to be seen than text
+        if len(message.attachments) > 0:
+            # Analyze all the attachments of a message
+            scores_list = self.eval_images(message)
+            # Make an object that has the maximum score of each one
+            max_scores = {}
+            for scores in scores_list:
+                for key in scores:
+                    max_scores[key] = max(max_scores.get(key, 0), scores[key])
 
-        if scores["SPAM"] > 0.8:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
+            if max_scores["ADULT"] > 0.85:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="for having a sexually explicit image")
+            elif max_scores["GORE"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as promoting violence for having a bloody/gory image")
+            elif max_scores["GORE"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="as promoting violence for having a bloody/gory image")
+            elif max_scores["RACY"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="as having a sexually suggestive image")
 
-        if scores["THREAT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE)
-        elif scores["THREAT"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE)
+        # Now analyze the message's textual content
+        if len(message.content.strip()) > 0:
+            scores = self.eval_text(message)
 
-        if scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL)
-        elif scores["IDENTITY_ATTACK"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL)
+            if scores["SEXUALLY_EXPLICIT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
+            elif scores["SEVERE_TOXICITY"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS, explanation="as toxic")
+            elif scores["THREAT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as threatening")
+            elif scores["IDENTITY_ATTACK"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL, explanation="as hateful")
+            elif scores["SEXUALLY_EXPLICIT"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
+            elif scores["THREAT"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="for inciting violence")
+            elif scores["IDENTITY_ATTACK"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL, explanation="as hateful")
+            elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as toxic")
+            elif scores["FLIRTATION"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
+            elif scores["SPAM"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM, explanation="as spam")
 
-        if scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
-        elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS)
+    def eval_images(self, message):
+        scores_list = []
+        for attachment in message.attachments:
+            if not attachment.height:
+                # Non-image attachments will have no height and should be skipped
+                scores_list.append({"GORE": 0, "ADULT": 0, "RACY": 0})
+                continue
 
+            scores = {}
+
+            remote_image_features = ["adult"]
+            results = self.computervision_client.analyze_image(attachment.url, remote_image_features)
+
+            # Looks for blood and gore to mark as promoting violence or terrorism
+            scores["GORE"] = results.adult.gore_score
+            # Looks for sexually explicit photos to mark as sexual content
+            scores["ADULT"] = results.adult.adult_score
+            # Looks for suggestive photos to mark as sexual content with a lower priority
+            scores["RACY"] = results.adult.racy_score
+
+            scores_list.append(scores)
+        return scores_list
 
     def eval_text(self, message):
-        '''
-        Given a message, forwards the message to Perspective and returns a dictionary of scores.
-        '''
         PERSPECTIVE_URL = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze'
 
         url = PERSPECTIVE_URL + '?key=' + self.perspective_key
@@ -224,7 +330,9 @@ class ModBot(discord.Client, ReactionDelegator):
                 'INSULT': {},
                 'THREAT': {},
                 'TOXICITY': {},
-                'SPAM': {}
+                'SPAM': {},
+                'SEXUALLY_EXPLICIT': {},
+                'FLIRTATION': {}
             },
             'doNotStore': True
         }
@@ -238,7 +346,7 @@ class ModBot(discord.Client, ReactionDelegator):
         return scores
 
 
-    async def confirm_user_message(self, message, explicit=False, reason=None):
+    async def confirm_user_message(self, message, explicit=False, reason=None, explanation=""):
         # DMs a user asking if they are sure they want to send a message
         # explicit indicates whether the message should be hidden if they do decide to send it
         # reason is the reason for flagging the initial message (should be an AbuseType)
@@ -261,18 +369,13 @@ class ModBot(discord.Client, ReactionDelegator):
         msgEmbed = discord.Embed(
             color=discord.Color.greyple(),
             description=message.content
-        )
-        msgEmbed.set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        ).set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        # Get a list of images
+        images = tuple(filter(lambda attachment: attachment.height, message.attachments))
+        if len(images) > 0:
+            msgEmbed.set_image(url=images[0].url)
 
-        if reason:
-            textReason = {
-                AbuseType.SPAM: " as spam",
-                AbuseType.VIOLENCE: " for inciting violence",
-                AbuseType.HATEFUL: " as hateful",
-                AbuseType.HARASS: " as toxic",
-            }[reason]
-        else:
-            textReason = ""
+        textReason = " " + explanation if explanation else ""
 
         # Show the user their initial message
         await dmChannel.send(content=f"Your message was flagged{textReason} and removed:", embed=msgEmbed)
@@ -307,40 +410,47 @@ class ModBot(discord.Client, ReactionDelegator):
         sentMsg = None
         prefixMsg = None
 
+        files = tuple(filter(
+            lambda file: isinstance(file, discord.File),
+            await asyncio.gather(*(attachment.to_file(use_cached=True, spoiler=True) for attachment in message.attachments), return_exceptions=True)
+        ))
+
         # An "explicit" message is shown in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
         if explicit:
             content = message.content
-            # This alters the message slightly to disallow clever markdown formatting from getting through the spoiler
-            # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
-            reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
-            while reMatch:
-                code = reMatch.group(1).split("\n")
-                longestLine = max(map(lambda line: len(line), code))
-                code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
-                content = content[:reMatch.start()] + code + content[reMatch.end():]
+
+            if self.smart_spoilers:
+                # This alters the message slightly to disallow clever markdown formatting from getting through the spoiler
+                # Displayed code block elements are converted into inline code blocks since displayed code blocks are not hidden by spoilers
                 reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
+                while reMatch:
+                    code = reMatch.group(1).split("\n")
+                    longestLine = max(map(lambda line: len(line), code))
+                    code = "\n".join(f"`{{:{longestLine}}}`".format(line) for line in code)
+                    content = content[:reMatch.start()] + code + content[reMatch.end():]
+                    reMatch = re.search(r"```(?:\S*\n)?([\s\S]*?)\n?```", content)
 
-            # Now, any "||" in code blocks are converted to a look-alike (by inserting a zero-width space in between them)
-            # This is to prevent them from being recognized as closing spoiler elements
-            # Outside of code blocks, we can just escape the double bars with a "\|" but code blocks will show the literal "\"
-            reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
-            while reMatch:
-                content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                # Now, any "||" in code blocks are converted to a look-alike (by inserting a zero-width space in between them)
+                # This is to prevent them from being recognized as closing spoiler elements
+                # Outside of code blocks, we can just escape the double bars with a "\|" but code blocks will show the literal "\"
                 reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
+                while reMatch:
+                    content = content[:reMatch.start()] + reMatch.group(1) + "\u200b" + reMatch.group(2) + content[reMatch.end():]
+                    reMatch = re.search(r"(`(?:[^`]|\|(?!\|))*?\|)(\|(?:[^`]|\|(?!\|))*?`)", content)
 
-            # Remove any remaining spoiler tags in the comment by escaping each "|"
-            content = content.replace("||", "\\|\\|")
+                # Remove any remaining spoiler tags in the comment by escaping each "|"
+                content = content.replace("||", "\\|\\|")
 
             # Send a message to show who this message is from
             prefixMsg = await origChannel.send(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{message.author.mention} says:*")
             
             # Send the hidden message
-            sentMsg = await origChannel.send(content="||" + content + "||")
+            sentMsg = await origChannel.send(content="||" + content + "||" if content else "", files=files)
         else:
             # Send a message to show who this message is from
             prefixMsg = await origChannel.send(content=f"*{message.author.mention} says:*")
             # Show a non-explicit message as-is
-            sentMsg = await origChannel.send(content=message.content)
+            sentMsg = await origChannel.send(content=message.content, files=files)
 
         # Show the user that their message was sent
         await (message.author.dm_channel or await message.author.create_dm()).send(
@@ -359,6 +469,7 @@ class ModBot(discord.Client, ReactionDelegator):
             urgency = {
                 AbuseType.SPAM: 0,
                 AbuseType.VIOLENCE: 2,
+                AbuseType.SEXUAL: 1,
                 AbuseType.HATEFUL: 1,
                 AbuseType.HARASS: 1
             }[reason]
@@ -378,10 +489,39 @@ class ModBot(discord.Client, ReactionDelegator):
 
         await asyncio.gather(*(report.send_to_channel(channel, assignable=True) for channel in self.mod_channels.values()))
 
+        for member in origChannel.members:
+            now = time()
+            # Only look for users who have sent a message in the last hour
+            # this is to prevent spam for people who are offline
+            if member.id in self.last_messages:
+                if now - self.last_messages[member.id] > 60 * 60:
+                    # Remove them from the list of active users
+                    del self.last_messages[member.id]
+                else:
+                    await self.send_helper_message(member, sentMsg)
+
     async def reject_user_message(self, message, explicit=False, reason=None):
         await (message.author.dm_channel or await message.author.create_dm()).send(content="Thank you for taking the time to reconsider your message.")
         self.reviewing_messages[message.author.id] = False
 
+    async def send_helper_message(self, member, message):
+        if member.id not in self.helpers:
+            return
+        if message.id in self.message_aliases:
+            orig_message = self.message_aliases[message.id]
+            embed = discord.Embed(
+                color=discord.Color.blurple(),
+                description=f"[Jump to message]({message.jump_url})\n{orig_message.content}"
+            ).set_author(name=orig_message.author.display_name, icon_url=orig_message.author.avatar_url)
+        else:
+            embed = discord.Embed(
+                color=discord.Color.blurple(),
+                description=f"[Jump to message]({message.jump_url})\n{message.content}"
+            ).set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        for helper in self.helpers[member.id]:
+            channel = helper.dm_channel or await helper.create_dm()
+            await channel.send(content=f"{member.mention} wants you to review this message as one of their helpers:", embed=embed)
+            lastMsg = await channel.send(content="Do you want to start a user report for this message on the behalf.")
 
 client = ModBot(perspective_key)
 client.run(discord_token)
