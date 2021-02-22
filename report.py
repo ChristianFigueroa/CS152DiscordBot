@@ -457,7 +457,7 @@ class AutomatedReport(Report):
         try:
             await asyncio.gather(
                 self.prefix_message.edit(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{self.message.author.mention} says:*"),
-                self.replacement_message.edit(content="||" + content + "||")
+                self.replacement_message.edit(content="||" + content + "||" if content else "")
             )
         except:
             return False
@@ -658,7 +658,8 @@ class EditedBadMessageFlow(Flow):
         "ACCEPTABLE_EDIT",
         "TIME_EXPIRED"
     ))
-    def __init__(self, client, message, explicit=False, reason=None, explanation="", expiration_time=10 * 60):
+                             
+    def __init__(self, client, message, explicit=False, reason=None, explanation=None, expiration_time=10 * 60):
         super().__init__(channel=message.author.dm_channel, start_state=EditedBadMessageFlow.State.START)
         self.client = client
         self.author = message.author
@@ -711,17 +712,8 @@ class EditedBadMessageFlow(Flow):
     @Flow.help_message("Either say `re-send` to have the bot re-send your newly edited message, or make another edit to your message to something less inappropriate. If no action is taken within ten minutes, the message will be deleted.")
     async def start(self, message, simulated=False, introducing=False):
         if introducing:
-            if self.explanation:
-                textReason = " " + self.explanation
-            elif self.reason:
-                textReason = {
-                    AbuseType.SPAM: " as spam",
-                    AbuseType.VIOLENCE: " for inciting violence",
-                    AbuseType.HATEFUL: " as hateful",
-                    AbuseType.HARASS: " as toxic",
-                }[self.reason]
-            else:
-                textReason = ""
+            textReason = " " + self.explanation if self.explanation else ""
+
             await self.say((
                 f"Your edited message below has been flagged{textReason}.",
                 discord.Embed(

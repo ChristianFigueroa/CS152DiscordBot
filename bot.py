@@ -11,6 +11,8 @@ from textwrap import dedent
 from report import *
 from reactions import Reaction, ReactionDelegator
 from time import time
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from msrest.authentication import CognitiveServicesCredentials
 
 
 # Controls whether messages in DMs with the bot should also be monitored
@@ -21,7 +23,7 @@ FILTER_DMS = False
 # Trying to "|| a message ||" behind spoilers leads to "|||| a message ||||" (i.e., the spoilers cancel each other out)
 # Turning this on will look for that and other markdown tricks (like ``` code blocks ```) for trying to get around spoilers
 # This is True by default
-SMART_SPOILERS = False
+SMART_SPOILERS = True
 # DM the bot .debug smart_spoilers enable/disable/toggle to turn them on and off
 
 
@@ -41,7 +43,8 @@ with open(token_path) as f:
     tokens = json.load(f)
     discord_token = tokens['discord']
     perspective_key = tokens['perspective']
-
+    azure_key = tokens["azure"]
+    azure_endpoint = tokens["azure_endpoint"]
 
 class ModBot(discord.Client, ReactionDelegator):
     smart_spoilers = SMART_SPOILERS
@@ -60,6 +63,7 @@ class ModBot(discord.Client, ReactionDelegator):
         self.message_pairs = {}
         self.helpers = {}
         self.last_messages = {}
+        self.computervision_client = ComputerVisionClient(azure_endpoint, CognitiveServicesCredentials(azure_key))
 
     async def on_ready(self):
         print(f'{self.user.name} has connected to Discord! It is in these guilds:')
@@ -114,27 +118,28 @@ class ModBot(discord.Client, ReactionDelegator):
             return await self.messages_pending_edit[payload.message_id].edited(message)
 
         if scores["SEXUALLY_EXPLICIT"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.SEXUAL)
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
         elif scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HARASS)
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HARASS, explanation="as toxic")
         elif scores["THREAT"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE)
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as threatening")
         elif scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL)
+            return await self.notify_user_edit_message(message, explicit=True, reason=AbuseType.HATEFUL, explanation="as hateful")
         elif scores["SEXUALLY_EXPLICIT"] > 0.75:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SEXUAL)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
         elif scores["THREAT"] > 0.75:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="for inciting violence")
         elif scores["IDENTITY_ATTACK"] > 0.75:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HATEFUL, explanation="as hateful")
         elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as toxic")
         elif scores["FLIRTATION"] > 0.8:
             return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
         elif scores["SPAM"] > 0.8:
-            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM)
+            return await self.notify_user_edit_message(message, explicit=False, reason=AbuseType.SPAM, explanation="as spam")
 
-    async def notify_user_edit_message(self, message, explicit=False, reason=None, explanation=""):
+    async def notify_user_edit_message(self, message, explicit=False, reason=None, explanation=None):
+
         message.author.dm_channel or await message.author.create_dm()
         flow = EditedBadMessageFlow(
             client=self,
@@ -244,37 +249,74 @@ class ModBot(discord.Client, ReactionDelegator):
         if not (FILTER_DMS and isinstance(message.channel, discord.DMChannel)) and message.channel.name != f'group-{self.group_num}':
            return
 
-        if message.content.strip() == "":
-            return
+        # First filter through images since those are more likely to be seen than text
+        if len(message.attachments) > 0:
+            # Analyze all the attachments of a message
+            scores_list = self.eval_images(message)
+            # Make an object that has the maximum score of each one
+            max_scores = {}
+            for scores in scores_list:
+                for key in scores:
+                    max_scores[key] = max(max_scores.get(key, 0), scores[key])
 
-        scores = self.eval_text(message)
+            if max_scores["ADULT"] > 0.85:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="for having a sexually explicit image")
+            elif max_scores["GORE"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as promoting violence for having a bloody/gory image")
+            elif max_scores["GORE"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="as promoting violence for having a bloody/gory image")
+            elif max_scores["RACY"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="as having a sexually suggestive image")
 
-        if scores["SEXUALLY_EXPLICIT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL)
-        elif scores["SEVERE_TOXICITY"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS)
-        elif scores["THREAT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE)
-        elif scores["IDENTITY_ATTACK"] > 0.9:
-            return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL)
-        elif scores["SEXUALLY_EXPLICIT"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SEXUAL)
-        elif scores["THREAT"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE)
-        elif scores["IDENTITY_ATTACK"] > 0.75:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL)
-        elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS)
-        elif scores["FLIRTATION"] > 0.8:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
-        elif scores["SPAM"] > 0.8:
-            return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM)
+        # Now analyze the message's textual content
+        if len(message.content.strip()) > 0:
+            scores = self.eval_text(message)
 
+            if scores["SEXUALLY_EXPLICIT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
+            elif scores["SEVERE_TOXICITY"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HARASS, explanation="as toxic")
+            elif scores["THREAT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.VIOLENCE, explanation="as threatening")
+            elif scores["IDENTITY_ATTACK"] > 0.9:
+                return await self.confirm_user_message(message, explicit=True, reason=AbuseType.HATEFUL, explanation="as hateful")
+            elif scores["SEXUALLY_EXPLICIT"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SEXUAL, explanation="as sexually explicit")
+            elif scores["THREAT"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.VIOLENCE, explanation="for inciting violence")
+            elif scores["IDENTITY_ATTACK"] > 0.75:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HATEFUL, explanation="as hateful")
+            elif scores["TOXICITY"] > 0.9 or scores["INSULT"] > 0.9:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as toxic")
+            elif scores["FLIRTATION"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.HARASS, explanation="as flirtation")
+            elif scores["SPAM"] > 0.8:
+                return await self.confirm_user_message(message, explicit=False, reason=AbuseType.SPAM, explanation="as spam")
+
+    def eval_images(self, message):
+        scores_list = []
+        for attachment in message.attachments:
+            if not attachment.height:
+                # Non-image attachments will have no height and should be skipped
+                scores_list.append({"GORE": 0, "ADULT": 0, "RACY": 0})
+                continue
+
+            scores = {}
+
+            remote_image_features = ["adult"]
+            results = self.computervision_client.analyze_image(attachment.url, remote_image_features)
+
+            # Looks for blood and gore to mark as promoting violence or terrorism
+            scores["GORE"] = results.adult.gore_score
+            # Looks for sexually explicit photos to mark as sexual content
+            scores["ADULT"] = results.adult.adult_score
+            # Looks for suggestive photos to mark as sexual content with a lower priority
+            scores["RACY"] = results.adult.racy_score
+
+            scores_list.append(scores)
+        return scores_list
 
     def eval_text(self, message):
-        '''
-        Given a message, forwards the message to Perspective and returns a dictionary of scores.
-        '''
         PERSPECTIVE_URL = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze'
 
         url = PERSPECTIVE_URL + '?key=' + self.perspective_key
@@ -328,21 +370,13 @@ class ModBot(discord.Client, ReactionDelegator):
         msgEmbed = discord.Embed(
             color=discord.Color.greyple(),
             description=message.content
-        )
-        msgEmbed.set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        ).set_author(name=message.author.display_name, icon_url=message.author.avatar_url)
+        # Get a list of images
+        images = tuple(filter(lambda attachment: attachment.height, message.attachments))
+        if len(images) > 0:
+            msgEmbed.set_image(url=images[0].url)
 
-        if explanation:
-            textReason = " " + explanation
-        elif reason:
-            textReason = {
-                AbuseType.SPAM: " as spam",
-                AbuseType.VIOLENCE: " for inciting violence",
-                AbuseType.HATEFUL: " as hateful",
-                AbuseType.HARASS: " as toxic",
-                AbuseType.SEXUAL: " as overtly sexual"
-            }[reason]
-        else:
-            textReason = ""
+        textReason = " " + explanation if explanation else ""
 
         # Show the user their initial message
         await dmChannel.send(content=f"Your message was flagged{textReason} and removed:", embed=msgEmbed)
@@ -377,6 +411,11 @@ class ModBot(discord.Client, ReactionDelegator):
         sentMsg = None
         prefixMsg = None
 
+        files = tuple(filter(
+            lambda file: isinstance(file, discord.File),
+            await asyncio.gather(*(attachment.to_file(use_cached=True, spoiler=True) for attachment in message.attachments), return_exceptions=True)
+        ))
+
         # An "explicit" message is shown in spoilers to be the equivalent of Instagram's "Show Sensitive Content" functionality
         if explicit:
             content = message.content
@@ -407,12 +446,12 @@ class ModBot(discord.Client, ReactionDelegator):
             prefixMsg = await origChannel.send(content=f"*The following message may contain inappropriate content. Click the black bar to reveal it.*\n*{message.author.mention} says:*")
             
             # Send the hidden message
-            sentMsg = await origChannel.send(content="||" + content + "||")
+            sentMsg = await origChannel.send(content="||" + content + "||" if content else "", files=files)
         else:
             # Send a message to show who this message is from
             prefixMsg = await origChannel.send(content=f"*{message.author.mention} says:*")
             # Show a non-explicit message as-is
-            sentMsg = await origChannel.send(content=message.content)
+            sentMsg = await origChannel.send(content=message.content, files=files)
 
         # Show the user that their message was sent
         await (message.author.dm_channel or await message.author.create_dm()).send(
