@@ -3,5 +3,3 @@ tokens.json
 discord.log
 __pycache__/
 classifier-code/data
-classifier-code/train
-classifier-code/valid

@@ -276,6 +276,7 @@ class ModBot(discord.Client, ReactionDelegator):
                         flaggedByOther = True
                 else:
                     try:
+                        flaggedByOther = True
                         await message.delete()
                     except discord.errors.Forbidden:
                         pass
@@ -379,7 +380,7 @@ class ModBot(discord.Client, ReactionDelegator):
 
     def report_ncmec(self, user, image):
         # This is supposed to mimic us sending a report to NCMEC, which we of course can't ACTUALLY do
-        print(f"A report was sent to NCMEC with {user.name}'s information for the image at {image.proxy_url}.")
+        print(f"A report was sent to NCMEC with {user.display_name}'s information for the image at {image.proxy_url}.")
 
     async def confirm_user_message(self, message, always_report=False, explicit=False, abuse_type=None, explanation="", urgency=None):
         # DMs a user asking if they are sure they want to send a message

@@ -19,7 +19,7 @@ TOKEN_PATH = "tokens.json"
 IMG_SIZE = 128
 HASH_SIZE = 12
 CSAM_SCORE_THRESHOLD = 0.8
-MODEL_GRAYSCALE = True
+MODEL_GRAYSCALE = False
 
 # Squelch TensorFlow debug messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -38,9 +38,9 @@ class ContentReviewer():
         # Load model
         self.csam_model = load_model('model.h5')
         self.csam_model.compile(
-            loss='binary_crossentropy',
+            loss="binary_crossentropy",
             optimizer="adam",
-            metrics=['accuracy']
+            metrics=["accuracy"]
         )
         self.hashlists = {
             "csam": open("csam.hashlist", "a+")
@@ -162,19 +162,39 @@ class ContentReviewer():
         self.hashlists["csam"].flush()
 
 if __name__ == "__main__":
+    from azure.cognitiveservices.vision.computervision.models._models_py3 import ComputerVisionErrorException as CVError
+
     reviewer = ContentReviewer()
 
-    _, _, files = next(os.walk("dataset"))
-    files = list(sorted(filter(lambda file: os.path.splitext(file)[1] in (".jpeg", ".jpg", ".png"), files), reverse=True))
+    offset = sys.argv[1] if len(sys.argv) > 1 else "0"
+    try:
+        offset = int(offset)
+    except ValueError:
+        raise ValueError("Supplied argument must be an int.")
 
+    _, _, files = next(os.walk("dataset"))
+    files = list(sorted(filter(lambda file: os.path.splitext(file)[1] in (".jpeg", ".jpg", ".png"), files)))[offset:]
+
+    if len(files) > 20:
+        print(f"Scanning files {offset} to {offset + 20} alphabetically (one-minute limit on Azure API); to scan another set of files, provide their index as an argument.")
+        files = files[:20]
+
+    skipCV = False
     for file in files:
-        img = cv2.imread(f"dataset/{file}", 0)
+        img = cv2.imread(f"dataset/{file}", 0 if MODEL_GRAYSCALE else 1)
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
-        img = np.reshape(img, (1, IMG_SIZE, IMG_SIZE, 1))
+        img = np.reshape(img, (1, IMG_SIZE, IMG_SIZE, 1 if MODEL_GRAYSCALE else 3))
 
         csam_prediction = reviewer.csam_model.predict(img)[0][0]
 
-        with open(f"dataset/{file}", "rb") as f:
-            azure_results = reviewer.computervision_client.analyze_image_in_stream(f, ["adult"])
+        try:
+            if not skipCV:
+                with open(f"dataset/{file}", "rb") as f:
+                    azure_results = reviewer.computervision_client.analyze_image_in_stream(f, ["adult"])
+        except CVError:
+            skipCV = True
 
-        print(f"{file}:\n  {'CSAM':^6}  {'GORE':^6}  {'ADULT':^6}  {'RACY':^6}\n  \u001b[{32 if csam_prediction > CSAM_SCORE_THRESHOLD else 2}m{csam_prediction * 100:6.2f}  \u001b[{32 if azure_results.adult.gore_score > 0.75 else 2}m{azure_results.adult.gore_score * 100:6.2f}\u001b[0m  \u001b[{32 if azure_results.adult.adult_score > 0.85 else 2}m{azure_results.adult.adult_score * 100:6.2f}\u001b[0m  \u001b[{32 if azure_results.adult.racy_score > 0.8 else 2}m{azure_results.adult.racy_score * 100:6.2f}\u001b[0m")
+        if skipCV:
+            print(f"{file}:\n  {'CSAM':^6}  {'GORE':^6}  {'ADULT':^6}  {'RACY':^6}\n  \u001b[{32 if csam_prediction > CSAM_SCORE_THRESHOLD else 2}m{csam_prediction * 100:6.2f}\u001b[0m  \u001b[33m{'WAIT':^6}\u001b[0m  \u001b[33m{'WAIT':^6}\u001b[0m  \u001b[33m{'WAIT':^6}\u001b[0m")
+        else:
+            print(f"{file}:\n  {'CSAM':^6}  {'GORE':^6}  {'ADULT':^6}  {'RACY':^6}\n  \u001b[{32 if csam_prediction > CSAM_SCORE_THRESHOLD else 2}m{csam_prediction * 100:6.2f}\u001b[0m  \u001b[{32 if azure_results.adult.gore_score > 0.75 else 2}m{azure_results.adult.gore_score * 100:6.2f}\u001b[0m  \u001b[{32 if azure_results.adult.adult_score > 0.85 else 2}m{azure_results.adult.adult_score * 100:6.2f}\u001b[0m  \u001b[{32 if azure_results.adult.racy_score > 0.8 else 2}m{azure_results.adult.racy_score * 100:6.2f}\u001b[0m")
